@@ -7,7 +7,8 @@ import discord
 import pytest
 
 from bracketbot import db, lifecycle
-from bracketbot.cog import BracketCog, DiscordPublisher
+from bracketbot.cog import EMBED_DESCRIPTION_LIMIT, BracketCog, DiscordPublisher
+from bracketbot.models import Match
 
 
 class FakeFollowup:
@@ -57,6 +58,49 @@ async def test_post_matchup_starts_with_zero_votes(conn, bracket_id):
     assert message_id == 1234
     content = publisher._send.await_args.kwargs["content"]
     assert content == ("**Final — Matchup 1**\n**Pizza**  vs  **Tacos**\n🗳️ **0 votes counted**")
+
+
+async def test_round_summary_chunks_stay_under_embed_limit(conn, bracket_id):
+    """32 max-length escaped names must not produce a >4096-char embed
+    description (Discord rejects the whole message, wedging the round)."""
+    publisher = DiscordPublisher(SimpleNamespace())
+    publisher._round_label = AsyncMock(return_value="Round 1")
+    publisher._image = AsyncMock(return_value="IMAGE")
+    sends = []
+
+    async def record_send(bracket, **kwargs):
+        sends.append(kwargs)
+
+    publisher._send = record_send
+
+    name = "*" * 80  # markdown-escapes to 160 characters
+    results = []
+    for slot in range(1, 17):
+        match = Match(
+            id=slot,
+            bracket_id=bracket_id,
+            round=1,
+            slot=slot,
+            item_a=1,
+            item_b=2,
+            winner="a",
+            decided_by="votes",
+            message_id=None,
+            published=True,
+        )
+        results.append(
+            lifecycle.MatchResult(match=match, a_name=name, b_name=name, votes_a=1, votes_b=0)
+        )
+
+    bracket = await db.get_bracket(conn, bracket_id)
+    await publisher.post_round_summary(bracket, 1, results)
+
+    assert len(sends) > 1  # too big for one embed, so it was split
+    assert all(len(kwargs["embed"].description) <= EMBED_DESCRIPTION_LIMIT for kwargs in sends)
+    assert "file" in sends[0]  # bracket image rides on the first message only
+    assert all("file" not in kwargs for kwargs in sends[1:])
+    joined = "\n".join(kwargs["embed"].description for kwargs in sends)
+    assert joined.count("beats") == len(results)  # no result line lost
 
 
 async def test_vote_total_counts_unique_voters(conn, bracket_id):
@@ -142,7 +186,7 @@ async def test_round_reveal_cannot_be_overwritten_by_vote_total(conn, bracket_id
             pass
 
     async def close_and_publish():
-        async with cog._locks[bracket_id]:
+        async with cog._lock(bracket_id):
             await lifecycle.close_round(conn, bracket_id, random.Random(0))
             await lifecycle.publish_round(conn, ResultPublisher(), bracket_id, now=0)
 

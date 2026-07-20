@@ -15,11 +15,13 @@ _WHITESPACE = re.compile(r"\s+")
 
 
 def normalize_name(raw: str) -> str | None:
-    """Collapse whitespace and strip; None if nothing printable remains or too long."""
+    """Collapse whitespace and strip; None if empty, too long, or containing any
+    non-printable character (control and bidirectional-formatting characters
+    could otherwise smuggle spoofed text into names)."""
     name = _WHITESPACE.sub(" ", raw).strip()
-    if not name or not any(ch.isprintable() and not ch.isspace() for ch in name):
+    if not name or len(name) > MAX_NAME_LENGTH:
         return None
-    if len(name) > MAX_NAME_LENGTH:
+    if any(not ch.isprintable() for ch in name):
         return None
     return name
 
@@ -94,3 +96,36 @@ def truncate(name: str, limit: int) -> str:
     if len(name) <= limit:
         return name
     return name[: limit - 1].rstrip() + "…"
+
+
+def chunk_lines(lines: Sequence[str], limit: int) -> list[str]:
+    """Greedily join lines with newlines into strings of at most limit
+    characters (for Discord's message/embed size caps). A single line longer
+    than limit is truncated rather than split."""
+    chunks: list[str] = []
+    current = ""
+    for line in lines:
+        line = truncate(line, limit)
+        if not current:
+            current = line
+        elif len(current) + 1 + len(line) <= limit:
+            current += "\n" + line
+        else:
+            chunks.append(current)
+            current = line
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def clamp_lines(lines: Sequence[str], limit: int) -> str:
+    """Join lines with newlines; if the result exceeds limit, keep whole
+    leading lines and end with an '…and N more' marker instead."""
+    text = "\n".join(lines)
+    if len(text) <= limit:
+        return text
+    for keep in range(len(lines) - 1, -1, -1):
+        clamped = "\n".join([*lines[:keep], f"…and {len(lines) - keep} more"])
+        if len(clamped) <= limit:
+            return clamped
+    return truncate(f"…and {len(lines)} more", limit)

@@ -100,27 +100,43 @@ async def start_bracket(conn: aiosqlite.Connection, bracket_id: int, rng: Random
                 winner, decided_by, published = "a", "bye", 1
             elif a is None:  # cannot happen with standard seeding; keep the db sane anyway
                 winner, decided_by, published = "b", "bye", 1
-            await conn.execute(
+            await db.execute(
+                conn,
                 "INSERT INTO matches (bracket_id, round, slot, item_a, item_b, winner,"
                 " decided_by, published) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (bracket_id, 1, slot, a, b, winner, decided_by, published),
             )
-        await conn.execute(
+        await db.execute(
+            conn,
             "UPDATE brackets SET status = ?, current_round = 1, round_state = 'open',"
             " round_closes_at = NULL WHERE id = ?",
             (RUNNING, bracket_id),
         )
 
 
-async def close_round(conn: aiosqlite.Connection, bracket_id: int, rng: Random) -> bool:
+async def close_round(
+    conn: aiosqlite.Connection,
+    bracket_id: int,
+    rng: Random,
+    expected_round: int | None = None,
+) -> bool:
     """Atomically close the current round; False if it was not open (already
-    closing/closed — the scheduler-vs-/next and double-close races land here)."""
+    closing/closed — the scheduler-vs-/next and double-close races land here).
+
+    Callers that decided to close based on an earlier read (a confirmation
+    dialog, the scheduler's deadline check) pass that read's round number as
+    expected_round so a round that opened in the meantime is never the one
+    that gets closed."""
     async with db.transaction(conn):
-        cur = await conn.execute(
+        sql = (
             "UPDATE brackets SET round_state = 'closing'"
-            " WHERE id = ? AND status = ? AND round_state = 'open'",
-            (bracket_id, RUNNING),
+            " WHERE id = ? AND status = ? AND round_state = 'open'"
         )
+        params: list = [bracket_id, RUNNING]
+        if expected_round is not None:
+            sql += " AND current_round = ?"
+            params.append(expected_round)
+        cur = await db.execute(conn, sql, params)
         if cur.rowcount == 0:
             return False
 
@@ -130,7 +146,8 @@ async def close_round(conn: aiosqlite.Connection, bracket_id: int, rng: Random) 
             if match.winner is None:
                 votes_a, votes_b = await db.tally(conn, match.id)
                 winner, decided_by = logic.decide(votes_a, votes_b, rng)
-                await conn.execute(
+                await db.execute(
+                    conn,
                     "UPDATE matches SET winner = ?, decided_by = ? WHERE id = ?",
                     (winner, decided_by, match.id),
                 )
@@ -140,7 +157,8 @@ async def close_round(conn: aiosqlite.Connection, bracket_id: int, rng: Random) 
             for slot in range(1, len(matches) // 2 + 1):
                 a = matches[2 * slot - 2].winner_item_id
                 b = matches[2 * slot - 1].winner_item_id
-                await conn.execute(
+                await db.execute(
+                    conn,
                     "INSERT OR IGNORE INTO matches (bracket_id, round, slot, item_a, item_b)"
                     " VALUES (?, ?, ?, ?, ?)",
                     (bracket_id, bracket.current_round + 1, slot, a, b),
@@ -189,19 +207,23 @@ async def publish_round(
         # duplicate announcement on restart, never a missing one.
         if is_final:
             await publisher.post_champion(bracket, results[0])
-            await conn.execute(
+            await db.execute(
+                conn,
                 "UPDATE brackets SET last_summary_round = ?, status = 'finished' WHERE id = ?",
                 (round_no, bracket_id),
             )
         else:
             await publisher.post_round_summary(bracket, round_no, results)
-            await conn.execute(
-                "UPDATE brackets SET last_summary_round = ? WHERE id = ?", (round_no, bracket_id)
+            await db.execute(
+                conn,
+                "UPDATE brackets SET last_summary_round = ? WHERE id = ?",
+                (round_no, bracket_id),
             )
     if is_final:
         return
 
-    await conn.execute(
+    await db.execute(
+        conn,
         "UPDATE brackets SET current_round = ?, round_state = 'open', round_closes_at = NULL"
         " WHERE id = ? AND current_round = ? AND round_state = 'closing'",
         (round_no + 1, bracket_id, round_no),
@@ -234,14 +256,16 @@ async def ensure_round_posted(
             bracket, match, names.get(match.item_a, "?"), names.get(match.item_b, "?")
         )
         await db.set_message_id(conn, match.id, message_id)
-    await conn.execute(
+    await db.execute(
+        conn,
         "UPDATE brackets SET round_closes_at = ? WHERE id = ? AND round_state = 'open'",
         (closes_at, bracket_id),
     )
 
 
 async def cancel_bracket(conn: aiosqlite.Connection, bracket_id: int) -> bool:
-    cur = await conn.execute(
+    cur = await db.execute(
+        conn,
         "UPDATE brackets SET status = 'cancelled' WHERE id = ? AND status IN (?, ?)",
         (bracket_id, SETUP, RUNNING),
     )
@@ -269,7 +293,7 @@ async def tick(
             and bracket.round_closes_at is not None
             and now >= bracket.round_closes_at
         ):
-            await close_round(conn, bracket_id, rng)
+            await close_round(conn, bracket_id, rng, expected_round=bracket.current_round)
             bracket = await db.get_bracket(conn, bracket_id)
         if bracket.round_state == "closing":
             await publish_round(conn, publisher, bracket_id, now)

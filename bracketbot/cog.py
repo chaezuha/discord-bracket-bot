@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import io
 import logging
 import random
 import time
-from collections import defaultdict
+import weakref
+from collections import OrderedDict
 from typing import Literal
 
 import aiosqlite
@@ -17,7 +19,7 @@ from discord.ext import commands, tasks
 
 from . import db, lifecycle, logic, render
 from .lifecycle import ChannelUnavailable, MatchResult
-from .models import RUNNING, SETUP, Bracket, Match
+from .models import CANCELLED, FINISHED, RUNNING, SETUP, Bracket, Match
 from .views import ConfirmView, vote_view, with_vote_count
 
 log = logging.getLogger(__name__)
@@ -26,6 +28,16 @@ log = logging.getLogger(__name__)
 _rng = random.SystemRandom()
 
 SCHEDULER_INTERVAL_SECONDS = 10
+
+# Discord size limits and how many rendered PNGs to keep around.
+EMBED_DESCRIPTION_LIMIT = 4096
+MESSAGE_CONTENT_LIMIT = 2000
+RENDER_CACHE_MAX = 32
+
+BAD_NAME_MESSAGE = (
+    f"That name is empty, longer than {logic.MAX_NAME_LENGTH} characters, "
+    "or contains unsupported characters."
+)
 
 
 def _esc(name: str | None) -> str:
@@ -67,8 +79,8 @@ class DiscordPublisher:
         except discord.Forbidden as exc:
             raise ChannelUnavailable(str(exc)) from exc
 
-    async def _image(self, bracket: Bracket) -> discord.File:
-        data = await self.cog.render_png(bracket.id)
+    async def _image(self, bracket: Bracket, *, as_finished: bool = False) -> discord.File:
+        data = await self.cog.render_png(bracket.id, as_finished=as_finished)
         return discord.File(io.BytesIO(data), filename=f"bracket-{bracket.id}.png")
 
     async def _round_label(self, bracket: Bracket, round_no: int) -> str:
@@ -129,13 +141,21 @@ class DiscordPublisher:
         self, bracket: Bracket, round_no: int, results: list[MatchResult]
     ) -> None:
         label = await self._round_label(bracket, round_no)
-        embed = discord.Embed(
-            title=f"{_esc(bracket.name)} — {label} results",
-            description="\n".join(self._result_line(r) for r in results),
-            color=discord.Color.green(),
-        )
-        embed.set_image(url=f"attachment://bracket-{bracket.id}.png")
-        await self._send(bracket, embed=embed, file=await self._image(bracket))
+        # Escaped 80-char names make long summaries; embed descriptions cap at
+        # 4096 chars and Discord rejects the whole message past that.
+        chunks = logic.chunk_lines([self._result_line(r) for r in results], EMBED_DESCRIPTION_LIMIT)
+        for i, chunk in enumerate(chunks):
+            part = f" ({i + 1}/{len(chunks)})" if len(chunks) > 1 else ""
+            embed = discord.Embed(
+                title=f"{_esc(bracket.name)} — {label} results{part}",
+                description=chunk,
+                color=discord.Color.green(),
+            )
+            if i == 0:
+                embed.set_image(url=f"attachment://bracket-{bracket.id}.png")
+                await self._send(bracket, embed=embed, file=await self._image(bracket))
+            else:
+                await self._send(bracket, embed=embed)
 
     async def post_champion(self, bracket: Bracket, result: MatchResult) -> None:
         embed = discord.Embed(
@@ -144,7 +164,10 @@ class DiscordPublisher:
             color=discord.Color.gold(),
         )
         embed.set_image(url=f"attachment://bracket-{bracket.id}.png")
-        await self._send(bracket, embed=embed, file=await self._image(bracket))
+        # The announcement goes out before status='finished' is persisted (a
+        # crash in between must duplicate the announcement, never lose it), so
+        # ask for the finished look explicitly to get the champion cell.
+        await self._send(bracket, embed=embed, file=await self._image(bracket, as_finished=True))
 
 
 @app_commands.guild_only()
@@ -156,9 +179,24 @@ class BracketCog(commands.GroupCog, name="bracket"):
     def __init__(self, bot) -> None:
         self.bot = bot
         self.publisher = DiscordPublisher(self)
-        self._locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+        # Entries vanish on their own once no task references them; never
+        # evict manually (a waiter could keep an orphaned lock while a new
+        # task gets a fresh one, breaking mutual exclusion).
+        self._locks: weakref.WeakValueDictionary[int, asyncio.Lock] = weakref.WeakValueDictionary()
         self._render_sem = asyncio.Semaphore(2)
-        self._render_cache: dict[int, tuple[tuple, bytes]] = {}
+        # LRU of rendered PNGs, bounded so a long-running bot doesn't keep an
+        # image for every bracket it ever drew (incl. finished ones re-shown).
+        self._render_cache: OrderedDict[int, tuple[tuple, bytes]] = OrderedDict()
+
+    def _lock(self, bracket_id: int) -> asyncio.Lock:
+        """Per-bracket lifecycle lock. Callers must keep the returned lock in
+        a local variable for the whole `async with` span — the registry holds
+        only weak references, so the local is what keeps the entry alive."""
+        lock = self._locks.get(bracket_id)
+        if lock is None:  # safe get-or-create: no await between lookup and store
+            lock = asyncio.Lock()
+            self._locks[bracket_id] = lock
+        return lock
 
     async def cog_load(self) -> None:
         self.scheduler.start()
@@ -184,14 +222,19 @@ class BracketCog(commands.GroupCog, name="bracket"):
     async def _wait_ready(self) -> None:
         await self.bot.wait_until_ready()
 
-    async def _tick(self, bracket_id: int) -> None:
-        async with self._locks[bracket_id]:
+    async def _tick(self, bracket_id: int) -> bool:
+        """One lifecycle tick; False if it failed (the scheduler will retry).
+        Interactive callers use the result to avoid claiming success."""
+        lock = self._lock(bracket_id)
+        async with lock:
             try:
                 await lifecycle.tick(
                     self.bot.db, self.publisher, bracket_id, now=int(time.time()), rng=_rng
                 )
             except Exception:
                 log.exception("Tick failed for bracket %s (will retry)", bracket_id)
+                return False
+        return True
 
     async def handle_vote(
         self, interaction: discord.Interaction, match_id: int, choice: str
@@ -202,7 +245,8 @@ class BracketCog(commands.GroupCog, name="bracket"):
             await interaction.followup.send("Voting for this matchup is closed.", ephemeral=True)
             return
 
-        async with self._locks[match.bracket_id]:
+        lock = self._lock(match.bracket_id)
+        async with lock:
             accepted = await db.cast_vote(
                 self.bot.db, match_id, interaction.user.id, choice, int(time.time())
             )
@@ -232,9 +276,13 @@ class BracketCog(commands.GroupCog, name="bracket"):
             ephemeral=True,
         )
 
-    async def render_png(self, bracket_id: int) -> bytes:
+    async def render_png(self, bracket_id: int, *, as_finished: bool = False) -> bytes:
+        """Render the bracket; as_finished draws the champion cell even though
+        status='finished' isn't persisted yet (the champion announcement)."""
         conn = self.bot.db
         bracket = await db.get_bracket(conn, bracket_id)
+        if as_finished:
+            bracket = dataclasses.replace(bracket, status=FINISHED)
         items = await db.item_names(conn, bracket_id)
         matches = await db.list_matches(conn, bracket_id)
         votes = {
@@ -250,10 +298,14 @@ class BracketCog(commands.GroupCog, name="bracket"):
         )
         cached = self._render_cache.get(bracket_id)
         if cached and cached[0] == key:
+            self._render_cache.move_to_end(bracket_id)
             return cached[1]
         async with self._render_sem:
             data = await asyncio.to_thread(render.render_bracket, bracket, items, matches, votes)
         self._render_cache[bracket_id] = (key, data)
+        self._render_cache.move_to_end(bracket_id)
+        while len(self._render_cache) > RENDER_CACHE_MAX:
+            self._render_cache.popitem(last=False)
         return data
 
     # --- command helpers ---------------------------------------------------
@@ -289,6 +341,35 @@ class BracketCog(commands.GroupCog, name="bracket"):
             return None
         return bracket
 
+    async def _recheck_editable(
+        self, interaction: discord.Interaction, bracket_id: int
+    ) -> Bracket | None:
+        """Second half of the edit preamble, run under the bracket lock: the
+        _editable_bracket checks ran before the lock, so status and edit
+        permissions may have changed in between."""
+        bracket = await db.get_bracket(self.bot.db, bracket_id)
+        if bracket is None or bracket.status != SETUP:
+            await self._fail(interaction, "The bracket has already started — items are locked in.")
+            return None
+        if not await self._can_edit(bracket, interaction.user):
+            await self._fail(interaction, "Editing is restricted on this bracket.")
+            return None
+        return bracket
+
+    async def _recheck_manager(
+        self, interaction: discord.Interaction, bracket_id: int
+    ) -> Bracket | None:
+        """Re-validate an owner/moderator command under the bracket lock, so
+        ownership or status changes can't slip between check and write."""
+        bracket = await db.get_bracket(self.bot.db, bracket_id)
+        if bracket is None or bracket.status not in (SETUP, RUNNING):
+            await self._fail(interaction, "That bracket already ended.")
+            return None
+        if not _is_manager(bracket, interaction.user):
+            await self._fail(interaction, "Only the bracket owner or a moderator can do that.")
+            return None
+        return bracket
+
     async def _item_autocomplete(
         self, interaction: discord.Interaction, current: str
     ) -> list[app_commands.Choice[str]]:
@@ -320,10 +401,7 @@ class BracketCog(commands.GroupCog, name="bracket"):
     ) -> None:
         normalized = logic.normalize_name(name)
         if normalized is None:
-            await self._fail(
-                interaction,
-                f"That name is empty or longer than {logic.MAX_NAME_LENGTH} characters.",
-            )
+            await self._fail(interaction, BAD_NAME_MESSAGE)
             return
         try:
             await db.create_bracket(
@@ -362,22 +440,24 @@ class BracketCog(commands.GroupCog, name="bracket"):
             return
         name = logic.normalize_name(item)
         if name is None:
-            await self._fail(
-                interaction,
-                f"That name is empty or longer than {logic.MAX_NAME_LENGTH} characters.",
-            )
+            await self._fail(interaction, BAD_NAME_MESSAGE)
             return
-        items = await db.list_items(self.bot.db, bracket.id)
-        if len(items) >= self.bot.config.max_items:
-            await self._fail(
-                interaction, f"This bracket is full ({self.bot.config.max_items} items)."
-            )
-            return
-        try:
-            await db.add_item(self.bot.db, bracket.id, name)
-        except aiosqlite.IntegrityError:
-            await self._fail(interaction, f"**{_esc(name)}** is already in the bracket.")
-            return
+        lock = self._lock(bracket.id)
+        async with lock:
+            bracket = await self._recheck_editable(interaction, bracket.id)
+            if bracket is None:
+                return
+            items = await db.list_items(self.bot.db, bracket.id)
+            if len(items) >= self.bot.config.max_items:
+                await self._fail(
+                    interaction, f"This bracket is full ({self.bot.config.max_items} items)."
+                )
+                return
+            try:
+                await db.add_item(self.bot.db, bracket.id, name)
+            except aiosqlite.IntegrityError:
+                await self._fail(interaction, f"**{_esc(name)}** is already in the bracket.")
+                return
         await interaction.response.send_message(
             f"Added **{_esc(name)}** — {len(items) + 1} item(s) so far.", ephemeral=True
         )
@@ -389,22 +469,26 @@ class BracketCog(commands.GroupCog, name="bracket"):
         bracket = await self._editable_bracket(interaction)
         if bracket is None:
             return
-        found = await db.find_item(self.bot.db, bracket.id, item)
-        if found is None:
-            await self._fail(interaction, "No such item in this bracket.")
-            return
         name = logic.normalize_name(new_name)
         if name is None:
-            await self._fail(
-                interaction,
-                f"That name is empty or longer than {logic.MAX_NAME_LENGTH} characters.",
-            )
+            await self._fail(interaction, BAD_NAME_MESSAGE)
             return
-        try:
-            await db.rename_item(self.bot.db, found.id, name)
-        except aiosqlite.IntegrityError:
-            await self._fail(interaction, f"**{_esc(name)}** is already in the bracket.")
-            return
+        lock = self._lock(bracket.id)
+        async with lock:
+            bracket = await self._recheck_editable(interaction, bracket.id)
+            if bracket is None:
+                return
+            # Resolve the target under the lock so a concurrent rename/remove
+            # can't swap it out from under us.
+            found = await db.find_item(self.bot.db, bracket.id, item)
+            if found is None:
+                await self._fail(interaction, "No such item in this bracket.")
+                return
+            try:
+                await db.rename_item(self.bot.db, found.id, name)
+            except aiosqlite.IntegrityError:
+                await self._fail(interaction, f"**{_esc(name)}** is already in the bracket.")
+                return
         await interaction.response.send_message(
             f"Renamed **{_esc(found.name)}** to **{_esc(name)}**.", ephemeral=True
         )
@@ -416,11 +500,16 @@ class BracketCog(commands.GroupCog, name="bracket"):
         bracket = await self._editable_bracket(interaction)
         if bracket is None:
             return
-        found = await db.find_item(self.bot.db, bracket.id, item)
-        if found is None:
-            await self._fail(interaction, "No such item in this bracket.")
-            return
-        await db.remove_item(self.bot.db, found.id)
+        lock = self._lock(bracket.id)
+        async with lock:
+            bracket = await self._recheck_editable(interaction, bracket.id)
+            if bracket is None:
+                return
+            found = await db.find_item(self.bot.db, bracket.id, item)
+            if found is None:
+                await self._fail(interaction, "No such item in this bracket.")
+                return
+            await db.remove_item(self.bot.db, found.id)
         await interaction.response.send_message(f"Removed **{_esc(found.name)}**.", ephemeral=True)
 
     @app_commands.command(description="List the items in this channel's bracket")
@@ -431,7 +520,11 @@ class BracketCog(commands.GroupCog, name="bracket"):
             return
         items = await db.list_items(self.bot.db, bracket.id)
         listing = (
-            "\n".join(f"{i}. {_esc(item.name)}" for i, item in enumerate(items, 1)) or "*none yet*"
+            logic.clamp_lines(
+                [f"{i}. {_esc(item.name)}" for i, item in enumerate(items, 1)],
+                EMBED_DESCRIPTION_LIMIT,
+            )
+            or "*none yet*"
         )
         embed = discord.Embed(
             title=f"{_esc(bracket.name)} — {len(items)} item(s)",
@@ -451,10 +544,11 @@ class BracketCog(commands.GroupCog, name="bracket"):
         if bracket is None:
             await self._fail(interaction, "No active bracket in this channel.")
             return
-        if not _is_manager(bracket, interaction.user):
-            await self._fail(interaction, "Only the bracket owner or a moderator can do that.")
-            return
-        await db.set_edit_mode(self.bot.db, bracket.id, mode)
+        lock = self._lock(bracket.id)
+        async with lock:
+            if await self._recheck_manager(interaction, bracket.id) is None:
+                return
+            await db.set_edit_mode(self.bot.db, bracket.id, mode)
         await interaction.response.send_message(f"Edit mode is now **{mode}**.", ephemeral=True)
 
     @editor.command(name="add", description="Allow a user to edit the bracket when restricted")
@@ -463,10 +557,11 @@ class BracketCog(commands.GroupCog, name="bracket"):
         if bracket is None:
             await self._fail(interaction, "No active bracket in this channel.")
             return
-        if not _is_manager(bracket, interaction.user):
-            await self._fail(interaction, "Only the bracket owner or a moderator can do that.")
-            return
-        await db.add_editor(self.bot.db, bracket.id, user.id)
+        lock = self._lock(bracket.id)
+        async with lock:
+            if await self._recheck_manager(interaction, bracket.id) is None:
+                return
+            await db.add_editor(self.bot.db, bracket.id, user.id)
         await interaction.response.send_message(
             f"{user.mention} can now edit items.", ephemeral=True
         )
@@ -477,10 +572,11 @@ class BracketCog(commands.GroupCog, name="bracket"):
         if bracket is None:
             await self._fail(interaction, "No active bracket in this channel.")
             return
-        if not _is_manager(bracket, interaction.user):
-            await self._fail(interaction, "Only the bracket owner or a moderator can do that.")
-            return
-        removed = await db.remove_editor(self.bot.db, bracket.id, user.id)
+        lock = self._lock(bracket.id)
+        async with lock:
+            if await self._recheck_manager(interaction, bracket.id) is None:
+                return
+            removed = await db.remove_editor(self.bot.db, bracket.id, user.id)
         await interaction.response.send_message(
             f"{user.mention} {'no longer has' if removed else 'did not have'} edit access.",
             ephemeral=True,
@@ -492,10 +588,11 @@ class BracketCog(commands.GroupCog, name="bracket"):
         if bracket is None:
             await self._fail(interaction, "No active bracket in this channel.")
             return
-        if not _is_manager(bracket, interaction.user):
-            await self._fail(interaction, "Only the bracket owner or a moderator can do that.")
-            return
-        await db.set_owner(self.bot.db, bracket.id, user.id)
+        lock = self._lock(bracket.id)
+        async with lock:
+            if await self._recheck_manager(interaction, bracket.id) is None:
+                return
+            await db.set_owner(self.bot.db, bracket.id, user.id)
         await interaction.response.send_message(
             f"**{_esc(bracket.name)}** now belongs to {user.mention}.",
             allowed_mentions=discord.AllowedMentions.none(),
@@ -524,13 +621,26 @@ class BracketCog(commands.GroupCog, name="bracket"):
             await self._fail(interaction, "Add at least 2 items before starting.")
             return
         await interaction.response.defer(ephemeral=True)
-        await db.set_round_seconds(
-            self.bot.db, bracket.id, round_minutes * 60 if round_minutes else None
-        )
-        async with self._locks[bracket.id]:
+        lock = self._lock(bracket.id)
+        async with lock:
+            # Everything above ran outside the lock; a concurrent /start or
+            # edit may have won the race, so re-check before writing.
+            fresh = await db.get_bracket(self.bot.db, bracket.id)
+            if fresh is None or fresh.status != SETUP or not _is_manager(fresh, interaction.user):
+                await self._fail(interaction, "No bracket in setup in this channel.")
+                return
+            if len(await db.list_items(self.bot.db, bracket.id)) < 2:
+                await self._fail(interaction, "Add at least 2 items before starting.")
+                return
+            await db.set_round_seconds(
+                self.bot.db, bracket.id, round_minutes * 60 if round_minutes else None
+            )
             await lifecycle.start_bracket(self.bot.db, bracket.id, _rng)
-        await self._tick(bracket.id)
-        await interaction.followup.send("Bracket started — round 1 is live!", ephemeral=True)
+        posted = await self._tick(bracket.id)
+        await interaction.followup.send(
+            await self._publish_outcome(bracket.id, posted, "Bracket started — round 1 is live!"),
+            ephemeral=True,
+        )
 
     @app_commands.command(name="next", description="Close the current round now and move on")
     async def next_round(self, interaction: discord.Interaction) -> None:
@@ -560,11 +670,51 @@ class BracketCog(commands.GroupCog, name="bracket"):
         await view.wait()
         if not view.value:
             return
-        async with self._locks[bracket.id]:
-            closed = await lifecycle.close_round(self.bot.db, bracket.id, _rng)
-        await self._tick(bracket.id)
-        message = "Round closed — results are up." if closed else "That round was already closed."
+        # The confirmation can sit for up to a minute; by the time it lands the
+        # timer may have closed this round (and opened the next one) or the
+        # bracket may have changed hands, so re-check everything under the lock.
+        expected_round = bracket.current_round
+        lock = self._lock(bracket.id)
+        async with lock:
+            fresh = await db.get_bracket(self.bot.db, bracket.id)
+            if fresh is None or fresh.status != RUNNING or fresh.current_round != expected_round:
+                await interaction.followup.send(
+                    "That round already closed while the confirmation was pending.",
+                    ephemeral=True,
+                )
+                return
+            if not _is_manager(fresh, interaction.user):
+                await interaction.followup.send(
+                    "Only the bracket owner or a moderator can do that.", ephemeral=True
+                )
+                return
+            closed = await lifecycle.close_round(
+                self.bot.db, bracket.id, _rng, expected_round=expected_round
+            )
+        posted = await self._tick(bracket.id)
+        if not closed:
+            message = "That round was already closed."
+        else:
+            message = await self._publish_outcome(
+                bracket.id, posted, "Round closed — results are up."
+            )
         await interaction.followup.send(message, ephemeral=True)
+
+    async def _publish_outcome(self, bracket_id: int, posted: bool, success: str) -> str:
+        """Truthful reply for /start and /next: the state transition is saved,
+        but posting to the channel may have failed or auto-cancelled it."""
+        bracket = await db.get_bracket(self.bot.db, bracket_id)
+        if bracket is not None and bracket.status == CANCELLED:
+            return (
+                "The bracket's channel is unusable (deleted or no access), "
+                "so the bracket was cancelled."
+            )
+        if not posted:
+            return (
+                "The change is saved, but posting to the channel failed — "
+                "the bot will keep retrying automatically."
+            )
+        return success
 
     @app_commands.command(description="Re-post the bracket image")
     @app_commands.checks.cooldown(1, 30.0, key=lambda i: i.channel_id)
@@ -577,11 +727,12 @@ class BracketCog(commands.GroupCog, name="bracket"):
             if bracket is None:
                 await self._fail(interaction, "No bracket to show in this channel.")
             else:
-                listing = "\n".join(f"{i}. {_esc(x.name)}" for i, x in enumerate(items, 1))
-                await interaction.response.send_message(
-                    f"**{_esc(bracket.name)}** hasn't started yet. Items so far:\n"
-                    f"{listing or '*none*'}"
+                header = f"**{_esc(bracket.name)}** hasn't started yet. Items so far:\n"
+                listing = logic.clamp_lines(
+                    [f"{i}. {_esc(x.name)}" for i, x in enumerate(items, 1)],
+                    MESSAGE_CONTENT_LIMIT - len(header),
                 )
+                await interaction.response.send_message(header + (listing or "*none*"))
             return
         await interaction.response.defer()
         data = await self.render_png(bracket.id)
@@ -605,12 +756,19 @@ class BracketCog(commands.GroupCog, name="bracket"):
         await view.wait()
         if not view.value:
             return
-        async with self._locks[bracket.id]:
+        # Re-check under the lock: the bracket may have ended, or ownership may
+        # have moved, while the confirmation sat unanswered.
+        lock = self._lock(bracket.id)
+        async with lock:
+            fresh = await self._recheck_manager(interaction, bracket.id)
+            if fresh is None:
+                return
             cancelled = await lifecycle.cancel_bracket(self.bot.db, bracket.id)
         if not cancelled:
             await interaction.followup.send("That bracket already ended.", ephemeral=True)
             return
-        await self._disable_open_matchups(bracket)
+        self._render_cache.pop(bracket.id, None)
+        await self._disable_open_matchups(fresh)
         channel = interaction.channel
         try:
             await channel.send(

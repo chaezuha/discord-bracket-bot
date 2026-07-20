@@ -166,6 +166,25 @@ async def test_double_close_and_next_vs_scheduler(conn, bracket_id, publisher, r
     assert not await lifecycle.close_round(conn, bracket_id, rng)
 
 
+async def test_stale_close_cannot_close_the_next_round(conn, bracket_id, publisher, rng):
+    """A close decided while round 1 was open (e.g. a confirmation dialog)
+    must be a no-op once the bracket has advanced to round 2."""
+    await setup_items(conn, bracket_id, ["A", "B", "C", "D"])
+    await lifecycle.start_bracket(conn, bracket_id, rng)
+    await tick(conn, publisher, bracket_id)
+
+    assert await lifecycle.close_round(conn, bracket_id, rng, expected_round=1)
+    await tick(conn, publisher, bracket_id)
+    bracket = await db.get_bracket(conn, bracket_id)
+    assert bracket.current_round == 2 and bracket.round_state == "open"
+
+    assert not await lifecycle.close_round(conn, bracket_id, rng, expected_round=1)
+    bracket = await db.get_bracket(conn, bracket_id)
+    assert bracket.current_round == 2 and bracket.round_state == "open"  # untouched
+    # The current round can still be closed when addressed explicitly
+    assert await lifecycle.close_round(conn, bracket_id, rng, expected_round=2)
+
+
 async def test_tie_coinflip_persisted_not_rerolled(conn, bracket_id, publisher):
     await setup_items(conn, bracket_id, ["A", "B"])
     await lifecycle.start_bracket(conn, bracket_id, random.Random(1))

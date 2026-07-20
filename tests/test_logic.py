@@ -15,6 +15,42 @@ def test_normalize_name():
     assert logic.normalize_name("x" * 81) is None
 
 
+def test_normalize_name_rejects_control_and_bidi_characters():
+    assert logic.normalize_name("abc‮def") is None  # right-to-left override
+    assert logic.normalize_name("abc​def") is None  # zero-width space
+    assert logic.normalize_name("abc\x07def") is None  # control character
+    assert logic.normalize_name("abc⁦def") is None  # bidi isolate
+    assert logic.normalize_name("héllo wörld ✅") == "héllo wörld ✅"  # printable unicode is fine
+
+
+def test_chunk_lines():
+    assert logic.chunk_lines([], 10) == []
+    assert logic.chunk_lines(["a", "b"], 10) == ["a\nb"]
+    # "aaaa\nbbbb" is 9 chars; adding "\ncccc" would be 14 > 10
+    assert logic.chunk_lines(["aaaa", "bbbb", "cccc"], 10) == ["aaaa\nbbbb", "cccc"]
+    # A single oversized line is truncated, not split
+    chunks = logic.chunk_lines(["x" * 20], 10)
+    assert chunks == ["x" * 9 + "…"]
+    assert all(len(c) <= 10 for c in chunks)
+    # 16 escaped max-length result lines (the audit scenario) all fit their chunks
+    lines = ["✅ **" + "\\*" * 80 + "** beats " + "\\*" * 80 + " (0–0)" for _ in range(16)]
+    chunks = logic.chunk_lines(lines, 4096)
+    assert len(chunks) > 1
+    assert all(len(c) <= 4096 for c in chunks)
+    assert "\n".join(chunks).split("\n") == lines  # nothing lost or reordered
+
+
+def test_clamp_lines():
+    assert logic.clamp_lines([], 10) == ""
+    assert logic.clamp_lines(["a", "b"], 10) == "a\nb"
+    clamped = logic.clamp_lines([f"line {i}" for i in range(100)], 50)
+    assert len(clamped) <= 50
+    assert clamped.startswith("line 0")
+    assert clamped.endswith("more")
+    # Even a limit too small for any line yields something within the limit
+    assert len(logic.clamp_lines(["x" * 100] * 5, 8)) <= 8
+
+
 def test_bracket_size():
     assert logic.bracket_size(2) == 2
     assert logic.bracket_size(3) == 4

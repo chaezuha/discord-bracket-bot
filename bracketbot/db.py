@@ -3,8 +3,11 @@
 Invariants live in the schema (CHECKs, foreign keys, unique indexes) rather
 than only in application code, so races and bugs surface as IntegrityError
 instead of corrupt tournaments. The bot is a single process with one shared
-connection; aiosqlite serializes statements on it, and multi-row transitions
-use explicit BEGIN IMMEDIATE transactions.
+connection; every statement goes through the per-connection gate (`execute`,
+`fetchone`, `fetchall`), and multi-row transitions use explicit BEGIN
+IMMEDIATE transactions that hold the gate for their whole span — so no other
+coroutine's statement can interleave into (and be rolled back with, or read
+uncommitted state of) an open transaction.
 """
 
 from __future__ import annotations
@@ -13,6 +16,7 @@ import asyncio
 import os
 from collections.abc import Iterable
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 
 import aiosqlite
 
@@ -100,24 +104,72 @@ async def connect(path: str) -> aiosqlite.Connection:
     for number, script in enumerate(MIGRATIONS[version:], start=version + 1):
         await conn.executescript(script)
         await conn.execute(f"PRAGMA user_version = {number}")
-    # Serializes explicit transactions: aiosqlite runs statements on one shared
-    # connection, so two interleaved BEGINs from different tasks would clash.
-    conn._transaction_lock = asyncio.Lock()  # type: ignore[attr-defined]
+    # Serializes all statements against explicit transactions: aiosqlite runs
+    # everything on one shared connection, so a statement issued between another
+    # task's BEGIN and COMMIT would join (and roll back with) that transaction.
+    conn._db_lock = asyncio.Lock()  # type: ignore[attr-defined]
     return conn
+
+
+# The (connection, task) that currently holds an open transaction. Both parts
+# matter: the connection so multiple connections don't confuse each other, and
+# the task because child tasks inherit a copy of the parent's context — a task
+# spawned mid-transaction must not skip the gate.
+_txn_owner: ContextVar[tuple[aiosqlite.Connection, asyncio.Task] | None] = ContextVar(
+    "db_txn_owner", default=None
+)
+
+
+@asynccontextmanager
+async def _gate(conn: aiosqlite.Connection):
+    """Serialize against transactions; reentrant for the transaction owner."""
+    owner = _txn_owner.get()
+    if owner is not None and owner[0] is conn and owner[1] is asyncio.current_task():
+        yield
+        return
+    async with conn._db_lock:  # type: ignore[attr-defined]
+        yield
+
+
+async def execute(conn: aiosqlite.Connection, sql: str, params=()) -> aiosqlite.Cursor:
+    """Run one WRITE statement under the gate.
+
+    The returned cursor is for rowcount/lastrowid only — never fetch rows from
+    it (the gate is released on return, so a fetch would race transactions).
+    Reads go through fetchone/fetchall, which hold the gate through the fetch.
+    """
+    async with _gate(conn):
+        return await conn.execute(sql, params)
+
+
+async def fetchone(conn: aiosqlite.Connection, sql: str, params=()) -> aiosqlite.Row | None:
+    async with _gate(conn):
+        async with conn.execute(sql, params) as cur:
+            return await cur.fetchone()
+
+
+async def fetchall(conn: aiosqlite.Connection, sql: str, params=()) -> list[aiosqlite.Row]:
+    async with _gate(conn):
+        async with conn.execute(sql, params) as cur:
+            return list(await cur.fetchall())
 
 
 @asynccontextmanager
 async def transaction(conn: aiosqlite.Connection):
     """BEGIN IMMEDIATE .. COMMIT (ROLLBACK on error), one at a time per connection."""
-    async with conn._transaction_lock:  # type: ignore[attr-defined]
-        await conn.execute("BEGIN IMMEDIATE")
+    async with conn._db_lock:  # type: ignore[attr-defined]
+        token = _txn_owner.set((conn, asyncio.current_task()))
         try:
-            yield
-        except BaseException:
-            await conn.execute("ROLLBACK")
-            raise
-        else:
-            await conn.execute("COMMIT")
+            await conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield
+            except BaseException:
+                await conn.execute("ROLLBACK")
+                raise
+            else:
+                await conn.execute("COMMIT")
+        finally:
+            _txn_owner.reset(token)
 
 
 def _bracket(row: aiosqlite.Row) -> Bracket:
@@ -174,7 +226,8 @@ async def create_bracket(
     seeding: str,
     created_at: int,
 ) -> int:
-    cur = await conn.execute(
+    cur = await execute(
+        conn,
         "INSERT INTO brackets (guild_id, channel_id, owner_id, name, edit_mode, seeding,"
         " created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
         (guild_id, channel_id, owner_id, name, edit_mode, seeding, created_at),
@@ -183,51 +236,49 @@ async def create_bracket(
 
 
 async def get_bracket(conn: aiosqlite.Connection, bracket_id: int) -> Bracket | None:
-    async with conn.execute("SELECT * FROM brackets WHERE id = ?", (bracket_id,)) as cur:
-        row = await cur.fetchone()
+    row = await fetchone(conn, "SELECT * FROM brackets WHERE id = ?", (bracket_id,))
     return _bracket(row) if row else None
 
 
 async def get_active_bracket(conn: aiosqlite.Connection, channel_id: int) -> Bracket | None:
-    async with conn.execute(
+    row = await fetchone(
+        conn,
         "SELECT * FROM brackets WHERE channel_id = ? AND status IN (?, ?)",
         (channel_id, SETUP, RUNNING),
-    ) as cur:
-        row = await cur.fetchone()
+    )
     return _bracket(row) if row else None
 
 
 async def get_latest_finished_bracket(
     conn: aiosqlite.Connection, channel_id: int
 ) -> Bracket | None:
-    async with conn.execute(
+    row = await fetchone(
+        conn,
         "SELECT * FROM brackets WHERE channel_id = ? AND status = 'finished'"
         " ORDER BY id DESC LIMIT 1",
         (channel_id,),
-    ) as cur:
-        row = await cur.fetchone()
+    )
     return _bracket(row) if row else None
 
 
 async def list_running_brackets(conn: aiosqlite.Connection) -> list[Bracket]:
-    async with conn.execute("SELECT * FROM brackets WHERE status = ?", (RUNNING,)) as cur:
-        rows = await cur.fetchall()
+    rows = await fetchall(conn, "SELECT * FROM brackets WHERE status = ?", (RUNNING,))
     return [_bracket(r) for r in rows]
 
 
 async def set_edit_mode(conn: aiosqlite.Connection, bracket_id: int, edit_mode: str) -> None:
-    await conn.execute("UPDATE brackets SET edit_mode = ? WHERE id = ?", (edit_mode, bracket_id))
+    await execute(conn, "UPDATE brackets SET edit_mode = ? WHERE id = ?", (edit_mode, bracket_id))
 
 
 async def set_owner(conn: aiosqlite.Connection, bracket_id: int, owner_id: int) -> None:
-    await conn.execute("UPDATE brackets SET owner_id = ? WHERE id = ?", (owner_id, bracket_id))
+    await execute(conn, "UPDATE brackets SET owner_id = ? WHERE id = ?", (owner_id, bracket_id))
 
 
 async def set_round_seconds(
     conn: aiosqlite.Connection, bracket_id: int, round_seconds: int | None
 ) -> None:
-    await conn.execute(
-        "UPDATE brackets SET round_seconds = ? WHERE id = ?", (round_seconds, bracket_id)
+    await execute(
+        conn, "UPDATE brackets SET round_seconds = ? WHERE id = ?", (round_seconds, bracket_id)
     )
 
 
@@ -235,23 +286,22 @@ async def set_round_seconds(
 
 
 async def add_editor(conn: aiosqlite.Connection, bracket_id: int, user_id: int) -> None:
-    await conn.execute(
-        "INSERT OR IGNORE INTO editors (bracket_id, user_id) VALUES (?, ?)", (bracket_id, user_id)
+    await execute(
+        conn,
+        "INSERT OR IGNORE INTO editors (bracket_id, user_id) VALUES (?, ?)",
+        (bracket_id, user_id),
     )
 
 
 async def remove_editor(conn: aiosqlite.Connection, bracket_id: int, user_id: int) -> bool:
-    cur = await conn.execute(
-        "DELETE FROM editors WHERE bracket_id = ? AND user_id = ?", (bracket_id, user_id)
+    cur = await execute(
+        conn, "DELETE FROM editors WHERE bracket_id = ? AND user_id = ?", (bracket_id, user_id)
     )
     return cur.rowcount > 0
 
 
 async def list_editors(conn: aiosqlite.Connection, bracket_id: int) -> list[int]:
-    async with conn.execute(
-        "SELECT user_id FROM editors WHERE bracket_id = ?", (bracket_id,)
-    ) as cur:
-        rows = await cur.fetchall()
+    rows = await fetchall(conn, "SELECT user_id FROM editors WHERE bracket_id = ?", (bracket_id,))
     return [r["user_id"] for r in rows]
 
 
@@ -259,7 +309,8 @@ async def list_editors(conn: aiosqlite.Connection, bracket_id: int) -> list[int]
 
 
 async def add_item(conn: aiosqlite.Connection, bracket_id: int, name: str) -> int:
-    cur = await conn.execute(
+    cur = await execute(
+        conn,
         "INSERT INTO items (bracket_id, name, position) VALUES (?, ?,"
         " COALESCE((SELECT MAX(position) FROM items WHERE bracket_id = ?), 0) + 1)",
         (bracket_id, name, bracket_id),
@@ -268,18 +319,17 @@ async def add_item(conn: aiosqlite.Connection, bracket_id: int, name: str) -> in
 
 
 async def rename_item(conn: aiosqlite.Connection, item_id: int, name: str) -> None:
-    await conn.execute("UPDATE items SET name = ? WHERE id = ?", (name, item_id))
+    await execute(conn, "UPDATE items SET name = ? WHERE id = ?", (name, item_id))
 
 
 async def remove_item(conn: aiosqlite.Connection, item_id: int) -> None:
-    await conn.execute("DELETE FROM items WHERE id = ?", (item_id,))
+    await execute(conn, "DELETE FROM items WHERE id = ?", (item_id,))
 
 
 async def list_items(conn: aiosqlite.Connection, bracket_id: int) -> list[Item]:
-    async with conn.execute(
-        "SELECT * FROM items WHERE bracket_id = ? ORDER BY position", (bracket_id,)
-    ) as cur:
-        rows = await cur.fetchall()
+    rows = await fetchall(
+        conn, "SELECT * FROM items WHERE bracket_id = ? ORDER BY position", (bracket_id,)
+    )
     return [_item(r) for r in rows]
 
 
@@ -290,17 +340,16 @@ async def item_names(conn: aiosqlite.Connection, bracket_id: int) -> dict[int, s
 async def find_item(conn: aiosqlite.Connection, bracket_id: int, ref: str) -> Item | None:
     """Resolve an autocomplete value: item id as digits, else case-insensitive name."""
     if ref.isdigit():
-        async with conn.execute(
-            "SELECT * FROM items WHERE bracket_id = ? AND id = ?", (bracket_id, int(ref))
-        ) as cur:
-            row = await cur.fetchone()
+        row = await fetchone(
+            conn, "SELECT * FROM items WHERE bracket_id = ? AND id = ?", (bracket_id, int(ref))
+        )
         if row:
             return _item(row)
-    async with conn.execute(
+    row = await fetchone(
+        conn,
         "SELECT * FROM items WHERE bracket_id = ? AND name = ? COLLATE NOCASE",
         (bracket_id, ref.strip()),
-    ) as cur:
-        row = await cur.fetchone()
+    )
     return _item(row) if row else None
 
 
@@ -310,8 +359,9 @@ async def shuffle_positions(
     """Persist a shuffled seed order (item ids in their new position order)."""
     # Two passes so the UNIQUE(bracket_id, position) index never sees a clash.
     for position, item_id in enumerate(new_order, start=1):
-        await conn.execute("UPDATE items SET position = ? WHERE id = ?", (-position, item_id))
-    await conn.execute(
+        await execute(conn, "UPDATE items SET position = ? WHERE id = ?", (-position, item_id))
+    await execute(
+        conn,
         "UPDATE items SET position = -position WHERE bracket_id = ? AND position < 0",
         (bracket_id,),
     )
@@ -321,34 +371,32 @@ async def shuffle_positions(
 
 
 async def get_match(conn: aiosqlite.Connection, match_id: int) -> Match | None:
-    async with conn.execute("SELECT * FROM matches WHERE id = ?", (match_id,)) as cur:
-        row = await cur.fetchone()
+    row = await fetchone(conn, "SELECT * FROM matches WHERE id = ?", (match_id,))
     return _match(row) if row else None
 
 
 async def list_matches(conn: aiosqlite.Connection, bracket_id: int) -> list[Match]:
-    async with conn.execute(
-        "SELECT * FROM matches WHERE bracket_id = ? ORDER BY round, slot", (bracket_id,)
-    ) as cur:
-        rows = await cur.fetchall()
+    rows = await fetchall(
+        conn, "SELECT * FROM matches WHERE bracket_id = ? ORDER BY round, slot", (bracket_id,)
+    )
     return [_match(r) for r in rows]
 
 
 async def round_matches(conn: aiosqlite.Connection, bracket_id: int, round_no: int) -> list[Match]:
-    async with conn.execute(
+    rows = await fetchall(
+        conn,
         "SELECT * FROM matches WHERE bracket_id = ? AND round = ? ORDER BY slot",
         (bracket_id, round_no),
-    ) as cur:
-        rows = await cur.fetchall()
+    )
     return [_match(r) for r in rows]
 
 
 async def set_message_id(conn: aiosqlite.Connection, match_id: int, message_id: int) -> None:
-    await conn.execute("UPDATE matches SET message_id = ? WHERE id = ?", (message_id, match_id))
+    await execute(conn, "UPDATE matches SET message_id = ? WHERE id = ?", (message_id, match_id))
 
 
 async def mark_published(conn: aiosqlite.Connection, match_id: int) -> None:
-    await conn.execute("UPDATE matches SET published = 1 WHERE id = ?", (match_id,))
+    await execute(conn, "UPDATE matches SET published = 1 WHERE id = ?", (match_id,))
 
 
 # --- votes ------------------------------------------------------------------
@@ -363,7 +411,8 @@ async def cast_vote(
     after the round has flipped to 'closing' — the close transaction tallies
     after that flip, so every accepted vote is counted.
     """
-    cur = await conn.execute(
+    cur = await execute(
+        conn,
         """
         INSERT INTO votes (match_id, user_id, choice)
         SELECT :match_id, :user_id, :choice
@@ -382,10 +431,10 @@ async def cast_vote(
 
 
 async def tally(conn: aiosqlite.Connection, match_id: int) -> tuple[int, int]:
-    async with conn.execute(
+    rows = await fetchall(
+        conn,
         "SELECT choice, COUNT(*) AS n FROM votes WHERE match_id = ? GROUP BY choice",
         (match_id,),
-    ) as cur:
-        rows = await cur.fetchall()
+    )
     counts = {r["choice"]: r["n"] for r in rows}
     return counts.get("a", 0), counts.get("b", 0)

@@ -1,0 +1,14 @@
+# Keep secrets and local state out of the Docker build context entirely —
+# the Dockerfile COPYs selectively, but nothing sensitive should even be sent.
+.env
+.env.*
+!.env.example
+.git/
+.venv/
+data/
+logs/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+tests/
