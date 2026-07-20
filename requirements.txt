@@ -1,0 +1,5 @@
+# Exact pins for reproducible deployments; bump deliberately.
+discord.py==2.7.1
+aiosqlite==0.22.1
+Pillow==12.3.0
+python-dotenv==1.2.2

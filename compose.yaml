@@ -1,0 +1,27 @@
+services:
+  bot:
+    image: ghcr.io/chaezuha/discord-bracket-voting-bot:latest
+    pull_policy: always
+    env_file: .env
+    restart: unless-stopped
+    # Hardening: the container needs no privileges; only the SQLite data
+    # directory, the log directory, and /tmp have to be writable.
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    volumes:
+      # Bracket state lives in SQLite — run exactly one bot instance against
+      # this volume (SQLite is single-writer; the bot assumes one process).
+      - botdata:/app/data
+      # Rotating log files survive restarts; read with
+      #   docker compose exec bot tail -F logs/bot.log
+      - botlogs:/app/logs
+    mem_limit: 512m
+    pids_limit: 128
+
+volumes:
+  botdata:
+  botlogs:
