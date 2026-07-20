@@ -2,14 +2,26 @@
 
 from __future__ import annotations
 
-import time
-
 import discord
 
-from . import db
 from .logic import truncate
 
 BUTTON_LABEL_LIMIT = 80  # Discord's hard limit
+VOTE_COUNT_PREFIX = "🗳️ "
+
+
+def vote_count_line(count: int) -> str:
+    noun = "vote" if count == 1 else "votes"
+    return f"{VOTE_COUNT_PREFIX}**{count} {noun} counted**"
+
+
+def with_vote_count(content: str | None, count: int) -> str:
+    """Add or replace the public participation total on a matchup message."""
+    lines = [
+        line for line in (content or "").splitlines() if not line.startswith(VOTE_COUNT_PREFIX)
+    ]
+    lines.append(vote_count_line(count))
+    return "\n".join(lines)
 
 
 class VoteButton(
@@ -38,23 +50,14 @@ class VoteButton(
         return cls(int(match["match_id"]), match["choice"], label=item.label or "Vote")
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        conn = interaction.client.db  # BracketBot
-        accepted = await db.cast_vote(
-            conn, self.match_id, interaction.user.id, self.choice, int(time.time())
-        )
-        if not accepted:
-            await interaction.response.send_message(
-                "Voting for this matchup is closed.", ephemeral=True
+        await interaction.response.defer(ephemeral=True)
+        cog = interaction.client.get_cog("bracket")
+        if cog is None:
+            await interaction.followup.send(
+                "Voting is temporarily unavailable. Please try again.", ephemeral=True
             )
             return
-        match = await db.get_match(conn, self.match_id)
-        names = await db.item_names(conn, match.bracket_id) if match else {}
-        item_id = (match.item_a if self.choice == "a" else match.item_b) if match else None
-        name = discord.utils.escape_markdown(names.get(item_id, "?"))
-        await interaction.response.send_message(
-            f"🗳️ You voted for **{name}** — you can change your vote until the round ends.",
-            ephemeral=True,
-        )
+        await cog.handle_vote(interaction, self.match_id, self.choice)
 
 
 def vote_view(match_id: int, a_name: str, b_name: str) -> discord.ui.View:

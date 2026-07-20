@@ -18,7 +18,7 @@ from discord.ext import commands, tasks
 from . import db, lifecycle, logic, render
 from .lifecycle import ChannelUnavailable, MatchResult
 from .models import RUNNING, SETUP, Bracket, Match
-from .views import ConfirmView, vote_view
+from .views import ConfirmView, vote_view, with_vote_count
 
 log = logging.getLogger(__name__)
 
@@ -107,8 +107,9 @@ class DiscordPublisher:
         label = await self._round_label(bracket, match.round)
         message = await self._send(
             bracket,
-            content=(
-                f"**{label} — Matchup {match.slot}**\n**{_esc(a_name)}**  vs  **{_esc(b_name)}**"
+            content=with_vote_count(
+                f"**{label} — Matchup {match.slot}**\n**{_esc(a_name)}**  vs  **{_esc(b_name)}**",
+                0,
             ),
             view=vote_view(match.id, a_name, b_name),
         )
@@ -191,6 +192,45 @@ class BracketCog(commands.GroupCog, name="bracket"):
                 )
             except Exception:
                 log.exception("Tick failed for bracket %s (will retry)", bracket_id)
+
+    async def handle_vote(
+        self, interaction: discord.Interaction, match_id: int, choice: str
+    ) -> None:
+        """Record a vote and update its public total under the lifecycle lock."""
+        match = await db.get_match(self.bot.db, match_id)
+        if match is None:
+            await interaction.followup.send("Voting for this matchup is closed.", ephemeral=True)
+            return
+
+        async with self._locks[match.bracket_id]:
+            accepted = await db.cast_vote(
+                self.bot.db, match_id, interaction.user.id, choice, int(time.time())
+            )
+            if accepted:
+                votes_a, votes_b = await db.tally(self.bot.db, match_id)
+                names = await db.item_names(self.bot.db, match.bracket_id)
+                item_id = match.item_a if choice == "a" else match.item_b
+                name = _esc(names.get(item_id))
+                message = interaction.message
+                if message is not None:
+                    try:
+                        await message.edit(
+                            content=with_vote_count(message.content, votes_a + votes_b)
+                        )
+                    except discord.HTTPException as exc:
+                        log.warning(
+                            "Could not update vote total on message %s: %s",
+                            getattr(message, "id", "?"),
+                            exc,
+                        )
+
+        if not accepted:
+            await interaction.followup.send("Voting for this matchup is closed.", ephemeral=True)
+            return
+        await interaction.followup.send(
+            f"🗳️ You voted for **{name}** — you can change your vote until the round ends.",
+            ephemeral=True,
+        )
 
     async def render_png(self, bracket_id: int) -> bytes:
         conn = self.bot.db
@@ -621,7 +661,8 @@ async def help_command(interaction: discord.Interaction) -> None:
             "(with a confirmation). Ties are settled by coin flip.\n"
             "**Anytime** — `/bracket show` re-posts the bracket image, "
             "`/bracket transfer` hands the bracket over, `/bracket cancel` ends it.\n\n"
-            "Votes are private while a round is open; results and the bracket image are public."
+            "Choices and contender tallies are private while a round is open; the total "
+            "number of votes counted is public. Results and the bracket image are public."
         ),
         color=discord.Color.blurple(),
     )

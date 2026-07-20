@@ -16,7 +16,8 @@ rendered bracket image — until a champion is crowned.
   (`/bracket next`, with an are-you-sure confirmation), or both
 - Voting via buttons on each matchup message — your confirmation is private
   ("only visible to you"), you can change your vote until the round closes,
-  and tallies stay hidden until the reveal to avoid bandwagoning
+  and the public participation total updates live while each contender's tally
+  stays hidden until the reveal to avoid bandwagoning
 - The bracket is rendered as an image: a proper tournament tree with vote
   counts and highlighted winners at every level, updated as rounds finish
 - Proper seeding with byes when the item count isn't a power of two
