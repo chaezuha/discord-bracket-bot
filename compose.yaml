@@ -1,6 +1,6 @@
 services:
   bot:
-    image: ghcr.io/chaezuha/discord-bracket-voting-bot:latest
+    image: ghcr.io/chaezuha/discord-bracket-bot:latest
     pull_policy: always
     env_file: .env
     restart: unless-stopped

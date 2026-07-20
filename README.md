@@ -1,6 +1,6 @@
-# discord-bracket-voting-bot
+# discord-bracket-bot
 
-[![CI](https://github.com/chaezuha/discord-bracket-voting-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/chaezuha/discord-bracket-voting-bot/actions/workflows/ci.yml)
+[![CI](https://github.com/chaezuha/discord-bracket-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/chaezuha/discord-bracket-bot/actions/workflows/ci.yml)
 
 A self-hostable Discord bot for tournament-style voting brackets. Someone
 creates a bracket ("Best movie snack"), the channel fills it with contenders,
@@ -76,8 +76,8 @@ run `/bracket create`, use Discord's built-in per-command permissions
 Clone the repo, paste your bot token into `.env`, and start it:
 
 ```sh
-git clone https://github.com/chaezuha/discord-bracket-voting-bot.git
-cd discord-bracket-voting-bot
+git clone https://github.com/chaezuha/discord-bracket-bot.git
+cd discord-bracket-bot
 cp .env.example .env          # then edit .env and paste your bot token
 docker compose up -d          # pulls the prebuilt GHCR image (no local build)
 docker compose logs -f        # follow logs
@@ -130,14 +130,14 @@ Same image, without Compose (again with your token in `.env`; the `-v` flag
 keeps bracket state across restarts):
 
 ```sh
-docker run --env-file .env -v bracketdata:/app/data ghcr.io/chaezuha/discord-bracket-voting-bot:latest
+docker run --env-file .env -v bracketdata:/app/data ghcr.io/chaezuha/discord-bracket-bot:latest
 ```
 
 Or build it yourself from a clone:
 
 ```sh
-docker build -t discord-bracket-voting-bot .
-docker run --env-file .env -v bracketdata:/app/data discord-bracket-voting-bot
+docker build -t discord-bracket-bot .
+docker run --env-file .env -v bracketdata:/app/data discord-bracket-bot
 ```
 
 ### Alternative: run directly with Python
@@ -148,7 +148,7 @@ Arial is picked up automatically). Then:
 
 ```sh
 git clone <this repo>
-cd discord-bracket-voting-bot
+cd discord-bracket-bot
 python3 -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt

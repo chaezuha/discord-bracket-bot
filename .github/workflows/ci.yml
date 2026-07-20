@@ -55,10 +55,10 @@ jobs:
           context: .
           push: false
           load: true
-          tags: discord-bracket-voting-bot:ci
+          tags: discord-bracket-bot:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
-      - run: scripts/smoke.sh discord-bracket-voting-bot:ci
+      - run: scripts/smoke.sh discord-bracket-bot:ci
 
   publish:
     # Gated on the full CI suite; smoke-tests the amd64 image it is about to
