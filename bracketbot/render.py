@@ -121,7 +121,7 @@ def render_bracket(
 
     def draw_row(x: float, y: float, item_id: int | None, match: Match, side: str) -> None:
         if item_id is None:
-            draw.text((x + 10, y + 6), "—", font=font, fill=DIM)
+            draw.text((x + 10, y + 6), "BYE", font=font, fill=DIM)
             return
         name = items.get(item_id, "?")
         decided = match.winner is not None

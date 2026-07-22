@@ -47,3 +47,19 @@ async def test_render_sizes(conn, bracket_id, n):
 async def test_render_finished_bracket_has_champion(conn, bracket_id):
     data = await _rendered(conn, bracket_id, 5, finish=True)
     assert data[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+async def test_render_labels_bye_instead_of_dash(conn, bracket_id, monkeypatch):
+    drawn_text = []
+    original_text = render.ImageDraw.ImageDraw.text
+
+    def record_text(self, xy, text, *args, **kwargs):
+        drawn_text.append(text)
+        return original_text(self, xy, text, *args, **kwargs)
+
+    monkeypatch.setattr(render.ImageDraw.ImageDraw, "text", record_text)
+
+    await _rendered(conn, bracket_id, 3)
+
+    assert "BYE" in drawn_text
+    assert "—" not in drawn_text
