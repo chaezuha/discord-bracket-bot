@@ -58,8 +58,12 @@ class Publisher(Protocol):
     async def post_round_open(self, bracket: Bracket, round_no: int, closes_at: int | None) -> None:
         """Round header + current bracket image."""
 
-    async def post_matchup(self, bracket: Bracket, match: Match, a_name: str, b_name: str) -> int:
-        """Post one votable matchup message; return its message id."""
+    matchup_batch_size: int
+
+    async def post_matchups(
+        self, bracket: Bracket, matches: list[Match], names: dict[int, str]
+    ) -> dict[int, int]:
+        """Post votable matchup messages; return match id -> message id."""
 
     async def reveal_result(self, bracket: Bracket, result: MatchResult) -> None:
         """Edit a matchup message: disable buttons, show the tally and winner."""
@@ -251,11 +255,29 @@ async def ensure_round_posted(
         # after this line can duplicate the header on restart — harmless.
         await publisher.post_round_open(bracket, bracket.current_round, closes_at)
     names = await db.item_names(conn, bracket_id)
-    for match in missing:
-        message_id = await publisher.post_matchup(
-            bracket, match, names.get(match.item_a, "?"), names.get(match.item_b, "?")
-        )
-        await db.set_message_id(conn, match.id, message_id)
+    batch_size = max(1, getattr(publisher, "matchup_batch_size", 1))
+    batch_poster = getattr(publisher, "post_matchups", None)
+    for offset in range(0, len(missing), batch_size):
+        batch = missing[offset : offset + batch_size]
+        if batch_poster is None:
+            # Compatibility for third-party/test publishers that implement the
+            # original one-match-at-a-time protocol.
+            message_ids = {}
+            for match in batch:
+                message_ids[match.id] = await publisher.post_matchup(
+                    bracket,
+                    match,
+                    names.get(match.item_a, "?"),
+                    names.get(match.item_b, "?"),
+                )
+        else:
+            message_ids = await batch_poster(bracket, batch, names)
+        for match in batch:
+            try:
+                message_id = message_ids[match.id]
+            except KeyError:
+                raise RuntimeError(f"publisher did not return a message id for match {match.id}")
+            await db.set_message_id(conn, match.id, message_id)
     await db.execute(
         conn,
         "UPDATE brackets SET round_closes_at = ? WHERE id = ? AND round_state = 'open'",

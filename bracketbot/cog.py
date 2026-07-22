@@ -20,7 +20,7 @@ from discord.ext import commands, tasks
 from . import db, lifecycle, logic, render
 from .lifecycle import ChannelUnavailable, MatchResult
 from .models import CANCELLED, FINISHED, RUNNING, SETUP, Bracket, Match
-from .views import ConfirmView, vote_view, with_vote_count
+from .views import ConfirmView, vote_board_view, vote_count_line, vote_view, with_vote_count
 
 log = logging.getLogger(__name__)
 
@@ -33,6 +33,8 @@ SCHEDULER_INTERVAL_SECONDS = 10
 EMBED_DESCRIPTION_LIMIT = 4096
 MESSAGE_CONTENT_LIMIT = 2000
 RENDER_CACHE_MAX = 32
+PRIVATE_BOARD_MATCHES = 10
+PRIVATE_FOLLOWUP_LIMIT = 5
 
 BAD_NAME_MESSAGE = (
     f"That name is empty, longer than {logic.MAX_NAME_LENGTH} characters, "
@@ -42,6 +44,15 @@ BAD_NAME_MESSAGE = (
 
 def _esc(name: str | None) -> str:
     return discord.utils.escape_markdown(name or "?")
+
+
+def _context_type(interaction: discord.Interaction) -> str:
+    if getattr(interaction, "guild_id", None) is not None:
+        return "guild"
+    context = getattr(interaction, "context", None)
+    if context is not None and context.private_channel:
+        return "private"
+    return "bot_dm"
 
 
 def _is_manager(bracket: Bracket, user: discord.abc.User) -> bool:
@@ -59,6 +70,8 @@ class DiscordPublisher:
     logged and swallowed; only an unusable channel raises ChannelUnavailable,
     which makes the lifecycle auto-cancel the bracket.
     """
+
+    matchup_batch_size = 1
 
     def __init__(self, cog: BracketCog) -> None:
         self.cog = cog
@@ -115,6 +128,16 @@ class DiscordPublisher:
         embed.set_image(url=f"attachment://bracket-{bracket.id}.png")
         await self._send(bracket, embed=embed, file=await self._image(bracket))
 
+    async def post_matchups(
+        self, bracket: Bracket, matches: list[Match], names: dict[int, str]
+    ) -> dict[int, int]:
+        message_ids = {}
+        for match in matches:
+            a_name = names.get(match.item_a, "?")
+            b_name = names.get(match.item_b, "?")
+            message_ids[match.id] = await self.post_matchup(bracket, match, a_name, b_name)
+        return message_ids
+
     async def post_matchup(self, bracket: Bracket, match: Match, a_name: str, b_name: str) -> int:
         label = await self._round_label(bracket, match.round)
         message = await self._send(
@@ -170,7 +193,67 @@ class DiscordPublisher:
         await self._send(bracket, embed=embed, file=await self._image(bracket, as_finished=True))
 
 
-@app_commands.guild_only()
+class InteractionPublisher(DiscordPublisher):
+    """Publisher for user-installed apps in DMs/GDMs the bot cannot join.
+
+    Discord permits one response and five follow-ups per interaction. A /next
+    confirmation supplies a second token, so the publisher rotates tokens if a
+    worst-case 64-item results post needs a sixth public message.
+    """
+
+    matchup_batch_size = PRIVATE_BOARD_MATCHES
+
+    def __init__(
+        self,
+        cog: BracketCog,
+        interactions: list[discord.Interaction],
+        *,
+        use_original: bool,
+    ) -> None:
+        super().__init__(cog)
+        self.interactions = interactions
+        self.use_original = use_original
+        self._original_used = False
+        self._followups = [0] * len(interactions)
+
+    async def _send(self, bracket: Bracket, **kwargs) -> discord.Message:  # noqa: ARG002
+        if self.use_original and not self._original_used:
+            self._original_used = True
+            interaction = self.interactions[0]
+            file = kwargs.pop("file", None)
+            if file is not None:
+                kwargs["attachments"] = [file]
+            return await interaction.edit_original_response(**kwargs)
+
+        for index, interaction in enumerate(self.interactions):
+            if self._followups[index] >= PRIVATE_FOLLOWUP_LIMIT:
+                continue
+            self._followups[index] += 1
+            return await interaction.followup.send(wait=True, **kwargs)
+        raise RuntimeError("private interaction exhausted its Discord follow-up limit")
+
+    async def post_matchups(
+        self, bracket: Bracket, matches: list[Match], names: dict[int, str]
+    ) -> dict[int, int]:
+        message_ids = {}
+        for offset in range(0, len(matches), PRIVATE_BOARD_MATCHES):
+            board = matches[offset : offset + PRIVATE_BOARD_MATCHES]
+            message = await self._send(
+                bracket,
+                content=await self.cog.vote_board_content(bracket, board),
+                view=vote_board_view(board, names),
+            )
+            message_ids.update((match.id, message.id) for match in board)
+        return message_ids
+
+    async def reveal_result(self, bracket: Bracket, result: MatchResult) -> None:
+        # Interaction response messages cannot be edited with a later token.
+        # Results are posted as a fresh summary; stale boards self-disable if clicked.
+        return None
+
+
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
 class BracketCog(commands.GroupCog, name="bracket"):
     """Tournament-style voting brackets."""
 
@@ -204,6 +287,21 @@ class BracketCog(commands.GroupCog, name="bracket"):
     async def cog_unload(self) -> None:
         self.scheduler.cancel()
 
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        """A user install may expose commands in guilds without installing the bot.
+
+        That surface cannot support the channel publisher or server permission
+        model, so require the normal guild installation there.
+        """
+        if interaction.guild_id is not None and not interaction.is_guild_integration():
+            await self._fail(
+                interaction,
+                "Add the bot to this server before using brackets here. "
+                "User installs are for DMs and group chats.",
+            )
+            return False
+        return True
+
     # --- scheduler / lifecycle glue ---------------------------------------
 
     @tasks.loop(seconds=SCHEDULER_INTERVAL_SECONDS)
@@ -211,7 +309,7 @@ class BracketCog(commands.GroupCog, name="bracket"):
         """Closes due rounds and resumes any half-published state; the first
         pass after startup doubles as crash recovery."""
         try:
-            brackets = await db.list_running_brackets(self.bot.db)
+            brackets = await db.list_schedulable_brackets(self.bot.db)
         except Exception:
             log.exception("Scheduler could not list brackets")
             return
@@ -222,14 +320,18 @@ class BracketCog(commands.GroupCog, name="bracket"):
     async def _wait_ready(self) -> None:
         await self.bot.wait_until_ready()
 
-    async def _tick(self, bracket_id: int) -> bool:
+    async def _tick(self, bracket_id: int, publisher: lifecycle.Publisher | None = None) -> bool:
         """One lifecycle tick; False if it failed (the scheduler will retry).
         Interactive callers use the result to avoid claiming success."""
         lock = self._lock(bracket_id)
         async with lock:
             try:
                 await lifecycle.tick(
-                    self.bot.db, self.publisher, bracket_id, now=int(time.time()), rng=_rng
+                    self.bot.db,
+                    publisher or self.publisher,
+                    bracket_id,
+                    now=int(time.time()),
+                    rng=_rng,
                 )
             except Exception:
                 log.exception("Tick failed for bracket %s (will retry)", bracket_id)
@@ -240,13 +342,21 @@ class BracketCog(commands.GroupCog, name="bracket"):
         self, interaction: discord.Interaction, match_id: int, choice: str
     ) -> None:
         """Record a vote and update its public total under the lifecycle lock."""
+        response = getattr(interaction, "response", None)
+        edit_original = getattr(interaction, "edit_original_response", None)
         match = await db.get_match(self.bot.db, match_id)
         if match is None:
-            await interaction.followup.send("Voting for this matchup is closed.", ephemeral=True)
+            if response is None or response.is_done():
+                await interaction.followup.send(
+                    "Voting for this matchup is closed.", ephemeral=True
+                )
+            else:
+                await response.send_message("Voting for this matchup is closed.", ephemeral=True)
             return
 
         lock = self._lock(match.bracket_id)
         async with lock:
+            bracket = await db.get_bracket(self.bot.db, match.bracket_id)
             accepted = await db.cast_vote(
                 self.bot.db, match_id, interaction.user.id, choice, int(time.time())
             )
@@ -258,9 +368,15 @@ class BracketCog(commands.GroupCog, name="bracket"):
                 message = interaction.message
                 if message is not None:
                     try:
-                        await message.edit(
-                            content=with_vote_count(message.content, votes_a + votes_b)
-                        )
+                        if bracket.context_type == "private":
+                            board = await db.matches_for_message(self.bot.db, message.id)
+                            content = await self.vote_board_content(bracket, board)
+                        else:
+                            content = with_vote_count(message.content, votes_a + votes_b)
+                        if edit_original is None:
+                            await message.edit(content=content)
+                        else:
+                            await edit_original(content=content)
                     except discord.HTTPException as exc:
                         log.warning(
                             "Could not update vote total on message %s: %s",
@@ -269,12 +385,46 @@ class BracketCog(commands.GroupCog, name="bracket"):
                         )
 
         if not accepted:
-            await interaction.followup.send("Voting for this matchup is closed.", ephemeral=True)
+            if edit_original is not None and interaction.message is not None:
+                try:
+                    await edit_original(view=None)
+                except discord.HTTPException:
+                    pass
+            if response is None or response.is_done():
+                await interaction.followup.send(
+                    "Voting for this matchup is closed.", ephemeral=True
+                )
+            else:
+                await response.send_message("Voting for this matchup is closed.", ephemeral=True)
             return
-        await interaction.followup.send(
-            f"🗳️ You voted for **{name}** — you can change your vote until the round ends.",
-            ephemeral=True,
+        confirmation = (
+            f"🗳️ You voted for **{name}** — you can change your vote until the round ends."
         )
+        if response is None or response.is_done():
+            await interaction.followup.send(confirmation, ephemeral=True)
+        else:
+            await response.send_message(confirmation, ephemeral=True)
+
+    async def vote_board_content(self, bracket: Bracket, matches: list[Match]) -> str:
+        """Render compact shared-board totals without repeating long item names."""
+        if not matches:
+            return "No open matchups."
+        first_round = await db.round_matches(self.bot.db, bracket.id, 1)
+        total_rounds = logic.round_count(2 * len(first_round))
+        label = logic.round_label(matches[0].round, total_rounds)
+        first_slot, last_slot = matches[0].slot, matches[-1].slot
+        span = str(first_slot) if first_slot == last_slot else f"{first_slot}–{last_slot}"
+        lines = [f"**{label} — Matchups {span}**", "Choose a labeled button below:"]
+        names = await db.item_names(self.bot.db, bracket.id)
+        for match in matches:
+            votes_a, votes_b = await db.tally(self.bot.db, match.id)
+            a_name = logic.truncate(_esc(names.get(match.item_a)), 60)
+            b_name = logic.truncate(_esc(names.get(match.item_b)), 60)
+            lines.append(
+                f"**Matchup {match.slot}:** **{a_name}** vs **{b_name}** · "
+                f"{vote_count_line(votes_a + votes_b)}"
+            )
+        return "\n".join(lines)
 
     async def render_png(self, bracket_id: int, *, as_finished: bool = False) -> bytes:
         """Render the bracket; as_finished draws the champion cell even though
@@ -312,6 +462,26 @@ class BracketCog(commands.GroupCog, name="bracket"):
 
     async def _active(self, interaction: discord.Interaction) -> Bracket | None:
         return await db.get_active_bracket(self.bot.db, interaction.channel_id)
+
+    def _interaction_publisher(
+        self,
+        interaction: discord.Interaction,
+        *,
+        use_original: bool,
+        fallback: discord.Interaction | None = None,
+    ) -> InteractionPublisher:
+        interactions = [interaction]
+        if fallback is not None and fallback is not interaction:
+            interactions.append(fallback)
+        return InteractionPublisher(self, interactions, use_original=use_original)
+
+    async def _needs_post_repair(self, bracket: Bracket) -> bool:
+        if bracket.status != RUNNING:
+            return False
+        if bracket.round_state == "closing":
+            return True
+        matches = await db.round_matches(self.bot.db, bracket.id, bracket.current_round)
+        return any(not match.is_bye and match.message_id is None for match in matches)
 
     @staticmethod
     async def _fail(interaction: discord.Interaction, message: str) -> None:
@@ -406,13 +576,14 @@ class BracketCog(commands.GroupCog, name="bracket"):
         try:
             await db.create_bracket(
                 self.bot.db,
-                guild_id=interaction.guild_id,
+                guild_id=interaction.guild_id or 0,
                 channel_id=interaction.channel_id,
                 owner_id=interaction.user.id,
                 name=normalized,
                 edit_mode=edit_mode,
                 seeding=seeding,
                 created_at=int(time.time()),
+                context_type=_context_type(interaction),
             )
         except aiosqlite.IntegrityError:
             await self._fail(
@@ -552,7 +723,7 @@ class BracketCog(commands.GroupCog, name="bracket"):
         await interaction.response.send_message(f"Edit mode is now **{mode}**.", ephemeral=True)
 
     @editor.command(name="add", description="Allow a user to edit the bracket when restricted")
-    async def editor_add(self, interaction: discord.Interaction, user: discord.Member) -> None:
+    async def editor_add(self, interaction: discord.Interaction, user: discord.User) -> None:
         bracket = await self._active(interaction)
         if bracket is None:
             await self._fail(interaction, "No active bracket in this channel.")
@@ -567,7 +738,7 @@ class BracketCog(commands.GroupCog, name="bracket"):
         )
 
     @editor.command(name="remove", description="Take a user's edit access away")
-    async def editor_remove(self, interaction: discord.Interaction, user: discord.Member) -> None:
+    async def editor_remove(self, interaction: discord.Interaction, user: discord.User) -> None:
         bracket = await self._active(interaction)
         if bracket is None:
             await self._fail(interaction, "No active bracket in this channel.")
@@ -583,7 +754,7 @@ class BracketCog(commands.GroupCog, name="bracket"):
         )
 
     @app_commands.command(description="Hand bracket ownership to someone else")
-    async def transfer(self, interaction: discord.Interaction, user: discord.Member) -> None:
+    async def transfer(self, interaction: discord.Interaction, user: discord.User) -> None:
         bracket = await self._active(interaction)
         if bracket is None:
             await self._fail(interaction, "No active bracket in this channel.")
@@ -613,6 +784,14 @@ class BracketCog(commands.GroupCog, name="bracket"):
         if bracket is None or bracket.status != SETUP:
             await self._fail(interaction, "No bracket in setup in this channel.")
             return
+        is_private = bracket.context_type == "private"
+        if is_private and round_minutes is not None:
+            await self._fail(
+                interaction,
+                "Timers aren't available in friend or group DMs. "
+                "Start without `round_minutes`, then use `/bracket next`.",
+            )
+            return
         if not _is_manager(bracket, interaction.user):
             await self._fail(interaction, "Only the bracket owner or a moderator can start it.")
             return
@@ -620,7 +799,7 @@ class BracketCog(commands.GroupCog, name="bracket"):
         if len(items) < 2:
             await self._fail(interaction, "Add at least 2 items before starting.")
             return
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer(ephemeral=not is_private)
         lock = self._lock(bracket.id)
         async with lock:
             # Everything above ran outside the lock; a concurrent /start or
@@ -636,7 +815,18 @@ class BracketCog(commands.GroupCog, name="bracket"):
                 self.bot.db, bracket.id, round_minutes * 60 if round_minutes else None
             )
             await lifecycle.start_bracket(self.bot.db, bracket.id, _rng)
-        posted = await self._tick(bracket.id)
+        publisher = (
+            self._interaction_publisher(interaction, use_original=True) if is_private else None
+        )
+        posted = await self._tick(bracket.id, publisher)
+        if is_private:
+            if not posted:
+                await interaction.followup.send(
+                    "The bracket is saved, but Discord stopped the round from posting. "
+                    "Run `/bracket show` to retry.",
+                    ephemeral=True,
+                )
+            return
         await interaction.followup.send(
             await self._publish_outcome(bracket.id, posted, "Bracket started — round 1 is live!"),
             ephemeral=True,
@@ -650,6 +840,18 @@ class BracketCog(commands.GroupCog, name="bracket"):
             return
         if not _is_manager(bracket, interaction.user):
             await self._fail(interaction, "Only the bracket owner or a moderator can do that.")
+            return
+        is_private = bracket.context_type == "private"
+        if is_private and await self._needs_post_repair(bracket):
+            await interaction.response.defer()
+            posted = await self._tick(
+                bracket.id, self._interaction_publisher(interaction, use_original=True)
+            )
+            if not posted:
+                await interaction.followup.send(
+                    "The bracket is still saved, but Discord stopped recovery. Try again.",
+                    ephemeral=True,
+                )
             return
         if bracket.round_state != "open":
             await self._tick(bracket.id)  # nudge a stuck publish along
@@ -691,7 +893,23 @@ class BracketCog(commands.GroupCog, name="bracket"):
             closed = await lifecycle.close_round(
                 self.bot.db, bracket.id, _rng, expected_round=expected_round
             )
-        posted = await self._tick(bracket.id)
+        publisher = None
+        if is_private:
+            confirmed_interaction = view.interaction or interaction
+            publisher = self._interaction_publisher(
+                confirmed_interaction,
+                use_original=False,
+                fallback=interaction if confirmed_interaction is not interaction else None,
+            )
+        posted = await self._tick(bracket.id, publisher)
+        if is_private:
+            if not posted:
+                await interaction.followup.send(
+                    "The round result is saved, but Discord stopped it from posting. "
+                    "Run `/bracket next` or `/bracket show` to retry.",
+                    ephemeral=True,
+                )
+            return
         if not closed:
             message = "That round was already closed."
         else:
@@ -734,10 +952,21 @@ class BracketCog(commands.GroupCog, name="bracket"):
                 )
                 await interaction.response.send_message(header + (listing or "*none*"))
             return
+        if bracket.context_type == "private" and await self._needs_post_repair(bracket):
+            await interaction.response.defer()
+            posted = await self._tick(
+                bracket.id, self._interaction_publisher(interaction, use_original=True)
+            )
+            if not posted:
+                await interaction.followup.send(
+                    "The bracket is still saved, but Discord stopped recovery. Try again.",
+                    ephemeral=True,
+                )
+            return
         await interaction.response.defer()
         data = await self.render_png(bracket.id)
-        await interaction.followup.send(
-            file=discord.File(io.BytesIO(data), filename=f"bracket-{bracket.id}.png")
+        await interaction.edit_original_response(
+            attachments=[discord.File(io.BytesIO(data), filename=f"bracket-{bracket.id}.png")]
         )
 
     @app_commands.command(description="Cancel this channel's bracket")
@@ -769,25 +998,37 @@ class BracketCog(commands.GroupCog, name="bracket"):
             return
         self._render_cache.pop(bracket.id, None)
         await self._disable_open_matchups(fresh)
-        channel = interaction.channel
-        try:
-            await channel.send(
+        if fresh.context_type == "private":
+            confirmed_interaction = view.interaction or interaction
+            await confirmed_interaction.followup.send(
                 f"❌ **{_esc(bracket.name)}** was cancelled by {interaction.user.mention}."
             )
-        except discord.HTTPException:
-            pass
+        else:
+            channel = interaction.channel
+            try:
+                await channel.send(
+                    f"❌ **{_esc(bracket.name)}** was cancelled by {interaction.user.mention}."
+                )
+            except discord.HTTPException:
+                pass
         await interaction.followup.send("Bracket cancelled.", ephemeral=True)
 
     async def _disable_open_matchups(self, bracket: Bracket) -> None:
         """Best effort: strip vote buttons from still-open matchup messages."""
+        if bracket.context_type == "private":
+            return
         matches = await db.round_matches(self.bot.db, bracket.id, bracket.current_round)
         try:
             channel = await self.publisher._channel(bracket)
         except ChannelUnavailable:
             return
+        seen_messages = set()
         for match in matches:
             if match.message_id is None or match.winner is not None:
                 continue
+            if match.message_id in seen_messages:
+                continue
+            seen_messages.add(match.message_id)
             try:
                 await channel.get_partial_message(match.message_id).edit(view=None)
             except discord.HTTPException:
@@ -807,7 +1048,22 @@ class BracketCog(commands.GroupCog, name="bracket"):
 
 
 @app_commands.command(name="help", description="How the bracket bot works")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
 async def help_command(interaction: discord.Interaction) -> None:
+    if interaction.guild_id is not None and not interaction.is_guild_integration():
+        await interaction.response.send_message(
+            "Add the bot to this server before using brackets here. "
+            "User installs are for DMs and group chats.",
+            ephemeral=True,
+        )
+        return
+    private_note = (
+        "\n\n**Private chats** — friend and group DMs use manual rounds with "
+        "`/bracket next`; timed rounds require a server or a DM with the bot."
+        if getattr(interaction, "context", None) is not None and interaction.context.private_channel
+        else ""
+    )
     embed = discord.Embed(
         title="Bracket voting bot",
         description=(
@@ -821,6 +1077,7 @@ async def help_command(interaction: discord.Interaction) -> None:
             "`/bracket transfer` hands the bracket over, `/bracket cancel` ends it.\n\n"
             "Choices and contender tallies are private while a round is open; the total "
             "number of votes counted is public. Results and the bracket image are public."
+            f"{private_note}"
         ),
         color=discord.Color.blurple(),
     )

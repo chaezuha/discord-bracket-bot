@@ -30,6 +30,24 @@ async def test_migrations_are_idempotent(tmp_path):
     await second.close()
 
 
+async def test_context_migration_defaults_existing_brackets_to_guild(tmp_path):
+    path = str(tmp_path / "legacy.db")
+    legacy = await aiosqlite.connect(path, isolation_level=None)
+    await legacy.executescript(db.MIGRATIONS[0])
+    await legacy.execute("PRAGMA user_version = 1")
+    await legacy.execute(
+        "INSERT INTO brackets (guild_id, channel_id, owner_id, name, created_at) "
+        "VALUES (1, 100, 10, 'Legacy', 0)"
+    )
+    await legacy.close()
+
+    migrated = await db.connect(path)
+    bracket = await db.get_active_bracket(migrated, 100)
+    assert bracket.context_type == "guild"
+    assert (await db.fetchone(migrated, "PRAGMA user_version"))[0] == len(db.MIGRATIONS)
+    await migrated.close()
+
+
 async def test_one_active_bracket_per_channel(conn):
     first = await _create(conn)
     with pytest.raises(aiosqlite.IntegrityError):

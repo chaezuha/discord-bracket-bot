@@ -83,6 +83,10 @@ MIGRATIONS: list[str] = [
         PRIMARY KEY (match_id, user_id)
     );
     """,
+    """
+    ALTER TABLE brackets ADD COLUMN context_type TEXT NOT NULL DEFAULT 'guild'
+        CHECK (context_type IN ('guild', 'bot_dm', 'private'));
+    """,
 ]
 
 
@@ -177,6 +181,7 @@ def _bracket(row: aiosqlite.Row) -> Bracket:
         id=row["id"],
         guild_id=row["guild_id"],
         channel_id=row["channel_id"],
+        context_type=row["context_type"],
         owner_id=row["owner_id"],
         name=row["name"],
         status=row["status"],
@@ -225,12 +230,13 @@ async def create_bracket(
     edit_mode: str,
     seeding: str,
     created_at: int,
+    context_type: str = "guild",
 ) -> int:
     cur = await execute(
         conn,
         "INSERT INTO brackets (guild_id, channel_id, owner_id, name, edit_mode, seeding,"
-        " created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (guild_id, channel_id, owner_id, name, edit_mode, seeding, created_at),
+        " created_at, context_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (guild_id, channel_id, owner_id, name, edit_mode, seeding, created_at, context_type),
     )
     return cur.lastrowid
 
@@ -263,6 +269,16 @@ async def get_latest_finished_bracket(
 
 async def list_running_brackets(conn: aiosqlite.Connection) -> list[Bracket]:
     rows = await fetchall(conn, "SELECT * FROM brackets WHERE status = ?", (RUNNING,))
+    return [_bracket(r) for r in rows]
+
+
+async def list_schedulable_brackets(conn: aiosqlite.Connection) -> list[Bracket]:
+    """Running brackets whose channels the bot can publish to without an interaction."""
+    rows = await fetchall(
+        conn,
+        "SELECT * FROM brackets WHERE status = ? AND context_type != 'private'",
+        (RUNNING,),
+    )
     return [_bracket(r) for r in rows]
 
 
@@ -393,6 +409,15 @@ async def round_matches(conn: aiosqlite.Connection, bracket_id: int, round_no: i
 
 async def set_message_id(conn: aiosqlite.Connection, match_id: int, message_id: int) -> None:
     await execute(conn, "UPDATE matches SET message_id = ? WHERE id = ?", (message_id, match_id))
+
+
+async def matches_for_message(conn: aiosqlite.Connection, message_id: int) -> list[Match]:
+    rows = await fetchall(
+        conn,
+        "SELECT * FROM matches WHERE message_id = ? ORDER BY round, slot",
+        (message_id,),
+    )
+    return [_match(r) for r in rows]
 
 
 async def mark_published(conn: aiosqlite.Connection, match_id: int) -> None:

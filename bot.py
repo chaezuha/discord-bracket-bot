@@ -76,12 +76,13 @@ class BracketBot(commands.Bot):
         self.add_dynamic_items(VoteButton)
         await self.add_cog(BracketCog(self))
         self.tree.add_command(help_command)
+        # DMs and group DMs only receive global commands. Keep those synced
+        # even in development, then add the instant guild copy as well.
+        await self.tree.sync()
         if self.config.dev_guild_id:
             guild = discord.Object(id=self.config.dev_guild_id)
             self.tree.copy_global_to(guild=guild)
             await self.tree.sync(guild=guild)
-        else:
-            await self.tree.sync()
 
     async def close(self) -> None:
         try:

@@ -30,12 +30,15 @@ rendered bracket image — until a champion is crowned.
 - Bracket owners can hand over control (`/bracket transfer`); moderators
   (Manage Channels/Administrator) can always step in on any bracket
 - Slash commands, no privileged intents required
+- Works in servers, DMs with the bot, friend DMs, and group DMs. Friend/group
+  DM brackets advance manually with `/bracket next`; server and bot-DM
+  brackets can also use timers
 
 ## Commands
 
 | Command                          | What it does                                                                                       |
 | -------------------------------- | -------------------------------------------------------------------------------------------------- |
-| `/bracket create <name> [edit_mode] [seeding]` | Create a bracket in this channel (one active bracket per channel).                   |
+| `/bracket create <name> [edit_mode] [seeding]` | Create a bracket in this channel or conversation (one active bracket per channel).   |
 | `/bracket add <item>`            | Add a contender (before the bracket starts).                                                       |
 | `/bracket rename <item> <new_name>` | Rename a contender (autocompletes).                                                             |
 | `/bracket remove <item>`         | Remove a contender (autocompletes).                                                                |
@@ -49,13 +52,19 @@ rendered bracket image — until a champion is crowned.
 | `/bracket cancel`                | Cancel the bracket (asks for confirmation).                                                        |
 | `/help`                          | How it all works.                                                                                  |
 
-Everyone in the server can vote and use `/bracket show`, `/bracket items`,
-and `/help`. Item editing follows the bracket's edit mode. Round control
+Everyone who can see a matchup can vote. Users with the app installed can use
+`/bracket show`, `/bracket items`, and `/help`; item editing follows the
+bracket's edit mode. Round control
 (`start`/`next`/`cancel`/`transfer`/`editmode`/`editor`) is for the bracket
 owner — and for moderators with **Manage Channels** or **Administrator**, so
 a bracket can't lock up a channel if its owner disappears. To limit who can
 run `/bracket create`, use Discord's built-in per-command permissions
 (**Server Settings → Integrations → the bot**).
+
+In DMs and group DMs there are no server moderators, so only the bracket owner
+has owner-level control. An open bracket can still be edited by anyone in the
+conversation who installs the app, and explicitly selected editors can edit a
+restricted bracket.
 
 ## Setup
 
@@ -63,14 +72,20 @@ run `/bracket create`, use Discord's built-in per-command permissions
 
 1. Go to the [Discord Developer Portal](https://discord.com/developers/applications) and create a **New Application**.
 2. Under **Bot**, click **Reset Token** and copy the token (you'll need it for `.env`). No privileged intents are needed.
-3. Invite the bot to your server with this URL (replace `YOUR_CLIENT_ID` with the Application ID from **General Information**):
+3. Open **Installation** and enable both **Guild Install** and **User Install**
+   under Installation Contexts.
+4. Select **Discord Provided Link**. Configure the defaults as follows, then
+   save the application:
+   - **User Install:** `applications.commands`
+   - **Guild Install:** `applications.commands` and `bot`, with View Channels,
+     Send Messages, Send Messages in Threads, Embed Links, and Attach Files
+5. Copy the install link from that page. Choose **Add to server** for normal
+   server use, and choose **Add to my apps** to make the commands available in
+   DMs and group DMs. Install both ways if you want both surfaces.
 
-   ```
-   https://discord.com/oauth2/authorize?client_id=YOUR_CLIENT_ID&scope=bot%20applications.commands&permissions=274877959168
-   ```
-
-   (That permission set is: View Channels, Send Messages, Send Messages in
-   Threads, Embed Links, Attach Files.)
+User installation is required for friend/group-DM commands. A server install
+is still required in servers so the bot can post timed rounds and apply the
+normal moderator permission rules.
 
 ### 2. Run with Docker Compose (recommended)
 
@@ -159,9 +174,10 @@ python bot.py
 
 ### Slash-command sync
 
-Slash commands sync automatically on startup. A global sync can take up to an
-hour to show up in Discord, so set `DEV_GUILD_ID` in `.env` to your server's
-ID for instant sync while testing.
+Global commands sync automatically on startup, including when `DEV_GUILD_ID`
+is set (DM commands are always global). A global sync can take up to an hour to
+show up in Discord; `DEV_GUILD_ID` also creates an instant server-local copy
+while testing.
 
 ## Configuration (`.env`)
 
@@ -190,8 +206,13 @@ pushed.
 
 ## Notes
 
-- Commands are server-only. Threads work too, as long as the bot has the
-  Send Messages in Threads permission from the invite URL above.
+- Commands work in servers, threads, DMs with the bot, friend DMs, and group
+  DMs. Threads require Send Messages in Threads. Friend/group DMs are powered
+  by the user-installed app and must use manual `/bracket next` rounds because
+  Discord interaction tokens expire before a long-running timer can publish.
+- If a user-installed command appears in a server where the bot itself is not
+  installed, it explains that the server must install the bot instead of
+  starting a bracket that cannot publish later.
 - Round closing is atomic and idempotent: winners, coin flips, and the next
   round's pairings are persisted before anything is posted, so a crash or
   restart mid-round never rerolls a result or advances a bracket twice. If

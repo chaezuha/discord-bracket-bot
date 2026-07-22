@@ -20,6 +20,7 @@ class Bracket:
     id: int
     guild_id: int
     channel_id: int
+    context_type: str  # guild | bot_dm | private
     owner_id: int
     name: str
     status: str
