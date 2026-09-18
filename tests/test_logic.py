@@ -10,16 +10,16 @@ def test_normalize_name():
     assert logic.normalize_name("tabs\tand\nnewlines") == "tabs and newlines"
     assert logic.normalize_name("") is None
     assert logic.normalize_name("   \t\n ") is None
-    assert logic.normalize_name("​​") is None  # zero-width only
+    assert logic.normalize_name("\u200b\u200b") is None  # zero-width only
     assert logic.normalize_name("x" * 80) == "x" * 80
     assert logic.normalize_name("x" * 81) is None
 
 
 def test_normalize_name_rejects_control_and_bidi_characters():
-    assert logic.normalize_name("abc‮def") is None  # right-to-left override
-    assert logic.normalize_name("abc​def") is None  # zero-width space
+    assert logic.normalize_name("abc\u202edef") is None  # right-to-left override
+    assert logic.normalize_name("abc\u200bdef") is None  # zero-width space
     assert logic.normalize_name("abc\x07def") is None  # control character
-    assert logic.normalize_name("abc⁦def") is None  # bidi isolate
+    assert logic.normalize_name("abc\u2066def") is None  # bidi isolate
     assert logic.normalize_name("héllo wörld ✅") == "héllo wörld ✅"  # printable unicode is fine
 
 

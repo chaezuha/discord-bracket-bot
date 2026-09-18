@@ -50,7 +50,7 @@ class VoteButton(
         self.choice = choice
 
     @classmethod
-    async def from_custom_id(cls, interaction, item, match):  # noqa: ARG003
+    async def from_custom_id(cls, interaction, item, match):
         return cls(int(match["match_id"]), match["choice"], label=item.label or "Vote")
 
     async def callback(self, interaction: discord.Interaction) -> None:

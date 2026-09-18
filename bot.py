@@ -48,7 +48,10 @@ def setup_logging(log_dir: str) -> None:
             )
         )
         logging.getLogger().addHandler(file_handler)
-        _faulthandler_file = open(os.path.join(log_dir, "faulthandler.log"), "a", encoding="utf-8")
+        # faulthandler needs this descriptor to stay open for the process lifetime.
+        _faulthandler_file = open(  # noqa: SIM115
+            os.path.join(log_dir, "faulthandler.log"), "a", encoding="utf-8"
+        )
         faulthandler.enable(file=_faulthandler_file, all_threads=True)
     except OSError as exc:
         log.warning(

@@ -234,7 +234,7 @@ class InteractionPublisher(DiscordPublisher):
         self._original_used = False
         self._followups = [0] * len(interactions)
 
-    async def _send(self, bracket: Bracket, **kwargs) -> discord.Message:  # noqa: ARG002
+    async def _send(self, bracket: Bracket, **kwargs) -> discord.Message:
         if self.use_original and not self._original_used:
             self._original_used = True
             interaction = self.interactions[0]

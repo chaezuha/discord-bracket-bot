@@ -147,15 +147,13 @@ async def execute(conn: aiosqlite.Connection, sql: str, params=()) -> aiosqlite.
 
 
 async def fetchone(conn: aiosqlite.Connection, sql: str, params=()) -> aiosqlite.Row | None:
-    async with _gate(conn):
-        async with conn.execute(sql, params) as cur:
-            return await cur.fetchone()
+    async with _gate(conn), conn.execute(sql, params) as cur:
+        return await cur.fetchone()
 
 
 async def fetchall(conn: aiosqlite.Connection, sql: str, params=()) -> list[aiosqlite.Row]:
-    async with _gate(conn):
-        async with conn.execute(sql, params) as cur:
-            return list(await cur.fetchall())
+    async with _gate(conn), conn.execute(sql, params) as cur:
+        return list(await cur.fetchall())
 
 
 @asynccontextmanager
