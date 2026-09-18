@@ -14,10 +14,15 @@ rendered bracket image — until a champion is crowned.
   `/bracket editor`) — switchable at any time
 - Rounds run on a timer (`/bracket start round_minutes`), by manual advance
   (`/bracket next`, with an are-you-sure confirmation), or both
-- Voting via buttons on each matchup message — your confirmation is private
-  ("only visible to you"), you can change your vote until the round closes,
-  and the public participation total updates live while each contender's tally
-  stays hidden until the reveal to avoid bandwagoning
+- Compact voting boards group up to 10 matchups per message in every context.
+  Choose a numbered button; you can change your vote until the round closes.
+  Private vote receipts ("only visible to you") disappear after 8 seconds.
+  Public participation totals refresh at most once per second per board while
+  each contender's tally stays hidden until the reveal to avoid bandwagoning
+- A 16-entry bracket opens with two public messages (image plus voting board);
+  a 64-entry bracket opens with five (image plus four boards). Server and bot-DM
+  boards show all their results in place when closed; friend/group DMs keep
+  separate result summaries
 - The bracket is rendered as an image: a proper tournament tree with vote
   counts and highlighted winners at every level, updated as rounds finish
 - Proper seeding with byes when the item count isn't a power of two

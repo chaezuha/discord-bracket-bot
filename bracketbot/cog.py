@@ -10,6 +10,7 @@ import random
 import time
 import weakref
 from collections import OrderedDict
+from collections.abc import Callable
 from typing import Literal
 
 import aiosqlite
@@ -18,9 +19,10 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 from . import db, lifecycle, logic, render
+from .board_updates import BoardUpdates
 from .lifecycle import ChannelUnavailable, MatchResult
 from .models import CANCELLED, FINISHED, RUNNING, SETUP, Bracket, Match
-from .views import ConfirmView, vote_board_view, vote_count_line, vote_view, with_vote_count
+from .views import ConfirmView, vote_board_view, vote_count_line
 
 log = logging.getLogger(__name__)
 
@@ -33,7 +35,8 @@ SCHEDULER_INTERVAL_SECONDS = 10
 EMBED_DESCRIPTION_LIMIT = 4096
 MESSAGE_CONTENT_LIMIT = 2000
 RENDER_CACHE_MAX = 32
-PRIVATE_BOARD_MATCHES = 10
+BOARD_MATCHES = 10
+VOTE_CONFIRMATION_SECONDS = 8
 PRIVATE_FOLLOWUP_LIMIT = 5
 
 BAD_NAME_MESSAGE = (
@@ -44,6 +47,15 @@ BAD_NAME_MESSAGE = (
 
 def _esc(name: str | None) -> str:
     return discord.utils.escape_markdown(name or "?")
+
+
+def _fit_board(render_content: Callable[[int], str]) -> str:
+    """Budget the final escaped text; never cut a Markdown escape in half."""
+    for limit in range(60, 0, -1):
+        content = render_content(limit)
+        if len(content) <= MESSAGE_CONTENT_LIMIT:
+            return content
+    raise ValueError("Board cannot fit within Discord's message limit")
 
 
 def _context_type(interaction: discord.Interaction) -> str:
@@ -71,7 +83,7 @@ class DiscordPublisher:
     which makes the lifecycle auto-cancel the bracket.
     """
 
-    matchup_batch_size = 1
+    matchup_batch_size = BOARD_MATCHES
 
     def __init__(self, cog: BracketCog) -> None:
         self.cog = cog
@@ -132,33 +144,41 @@ class DiscordPublisher:
         self, bracket: Bracket, matches: list[Match], names: dict[int, str]
     ) -> dict[int, int]:
         message_ids = {}
-        for match in matches:
-            a_name = names.get(match.item_a, "?")
-            b_name = names.get(match.item_b, "?")
-            message_ids[match.id] = await self.post_matchup(bracket, match, a_name, b_name)
+        for offset in range(0, len(matches), BOARD_MATCHES):
+            board = matches[offset : offset + BOARD_MATCHES]
+            message = await self._send(
+                bracket,
+                content=await self.cog.vote_board_content(bracket, board),
+                view=vote_board_view(board, names),
+            )
+            message_ids.update((match.id, message.id) for match in board)
         return message_ids
 
-    async def post_matchup(self, bracket: Bracket, match: Match, a_name: str, b_name: str) -> int:
-        label = await self._round_label(bracket, match.round)
-        message = await self._send(
-            bracket,
-            content=with_vote_count(
-                f"**{label} — Matchup {match.slot}**\n**{_esc(a_name)}**  vs  **{_esc(b_name)}**",
-                0,
-            ),
-            view=vote_view(match.id, a_name, b_name),
-        )
-        return message.id
+    async def reveal_board(
+        self, bracket: Bracket, message_id: int, results: list[MatchResult]
+    ) -> None:
+        label = await self._round_label(bracket, results[0].match.round)
 
-    async def reveal_result(self, bracket: Bracket, result: MatchResult) -> None:
-        match = result.match
-        label = await self._round_label(bracket, match.round)
-        content = f"**{label} — Matchup {match.slot}**\n{self._result_line(result)}"
+        def render_results(limit: int) -> str:
+            lines = [f"**{label} — Results**"]
+            for result in results:
+                shortened = dataclasses.replace(
+                    result,
+                    a_name=logic.truncate(result.a_name or "?", limit),
+                    b_name=logic.truncate(result.b_name or "?", limit),
+                )
+                lines.append(f"**Matchup {result.match.slot}:** {self._result_line(shortened)}")
+            return "\n".join(lines)
+
+        content = _fit_board(render_results)
         channel = await self._channel(bracket)
-        try:
-            await channel.get_partial_message(match.message_id).edit(content=content, view=None)
-        except discord.HTTPException as exc:
-            log.warning("Could not reveal result on message %s: %s", match.message_id, exc)
+        await self.cog.board_updates.queue(
+            message_id,
+            channel.get_partial_message(message_id).edit,
+            terminal=True,
+            content=content,
+            view=None,
+        )
 
     async def post_round_summary(
         self, bracket: Bracket, round_no: int, results: list[MatchResult]
@@ -201,8 +221,6 @@ class InteractionPublisher(DiscordPublisher):
     worst-case 64-item results post needs a sixth public message.
     """
 
-    matchup_batch_size = PRIVATE_BOARD_MATCHES
-
     def __init__(
         self,
         cog: BracketCog,
@@ -232,24 +250,12 @@ class InteractionPublisher(DiscordPublisher):
             return await interaction.followup.send(wait=True, **kwargs)
         raise RuntimeError("private interaction exhausted its Discord follow-up limit")
 
-    async def post_matchups(
-        self, bracket: Bracket, matches: list[Match], names: dict[int, str]
-    ) -> dict[int, int]:
-        message_ids = {}
-        for offset in range(0, len(matches), PRIVATE_BOARD_MATCHES):
-            board = matches[offset : offset + PRIVATE_BOARD_MATCHES]
-            message = await self._send(
-                bracket,
-                content=await self.cog.vote_board_content(bracket, board),
-                view=vote_board_view(board, names),
-            )
-            message_ids.update((match.id, message.id) for match in board)
-        return message_ids
-
-    async def reveal_result(self, bracket: Bracket, result: MatchResult) -> None:
-        # Interaction response messages cannot be edited with a later token.
-        # Results are posted as a fresh summary; stale boards self-disable if clicked.
-        return None
+    async def reveal_board(
+        self, bracket: Bracket, message_id: int, results: list[MatchResult]
+    ) -> None:
+        # Old posting tokens may have expired. Keep separate result summaries;
+        # stale boards self-disable on a click using that click's fresh token.
+        await self.cog.board_updates.finish(message_id)
 
 
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
@@ -262,6 +268,7 @@ class BracketCog(commands.GroupCog, name="bracket"):
     def __init__(self, bot) -> None:
         self.bot = bot
         self.publisher = DiscordPublisher(self)
+        self.board_updates = BoardUpdates()
         # Entries vanish on their own once no task references them; never
         # evict manually (a waiter could keep an orphaned lock while a new
         # task gets a fresh one, breaking mutual exclusion).
@@ -286,6 +293,7 @@ class BracketCog(commands.GroupCog, name="bracket"):
 
     async def cog_unload(self) -> None:
         self.scheduler.cancel()
+        await self.board_updates.close()
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         """A user install may expose commands in guilds without installing the bot.
@@ -341,17 +349,10 @@ class BracketCog(commands.GroupCog, name="bracket"):
     async def handle_vote(
         self, interaction: discord.Interaction, match_id: int, choice: str
     ) -> None:
-        """Record a vote and update its public total under the lifecycle lock."""
-        response = getattr(interaction, "response", None)
-        edit_original = getattr(interaction, "edit_original_response", None)
+        """Persist and queue snapshots under the lock; workers perform Discord I/O."""
         match = await db.get_match(self.bot.db, match_id)
         if match is None:
-            if response is None or response.is_done():
-                await interaction.followup.send(
-                    "Voting for this matchup is closed.", ephemeral=True
-                )
-            else:
-                await response.send_message("Voting for this matchup is closed.", ephemeral=True)
+            await self._fail(interaction, "Voting for this matchup is closed.")
             return
 
         lock = self._lock(match.bracket_id)
@@ -361,70 +362,65 @@ class BracketCog(commands.GroupCog, name="bracket"):
                 self.bot.db, match_id, interaction.user.id, choice, int(time.time())
             )
             if accepted:
-                votes_a, votes_b = await db.tally(self.bot.db, match_id)
                 names = await db.item_names(self.bot.db, match.bracket_id)
                 item_id = match.item_a if choice == "a" else match.item_b
                 name = _esc(names.get(item_id))
                 message = interaction.message
                 if message is not None:
-                    try:
-                        if bracket.context_type == "private":
-                            board = await db.matches_for_message(self.bot.db, message.id)
-                            content = await self.vote_board_content(bracket, board)
-                        else:
-                            content = with_vote_count(message.content, votes_a + votes_b)
-                        if edit_original is None:
-                            await message.edit(content=content)
-                        else:
-                            await edit_original(content=content)
-                    except discord.HTTPException as exc:
-                        log.warning(
-                            "Could not update vote total on message %s: %s",
-                            getattr(message, "id", "?"),
-                            exc,
-                        )
+                    board = await db.matches_for_message(self.bot.db, message.id)
+                    content = await self.vote_board_content(bracket, board)
+                    edit = getattr(interaction, "edit_original_response", None) or message.edit
+                    self.board_updates.queue(
+                        message.id, edit, content=content, view=vote_board_view(board, names)
+                    )
 
         if not accepted:
-            if edit_original is not None and interaction.message is not None:
-                try:
-                    await edit_original(view=None)
-                except discord.HTTPException:
-                    pass
-            if response is None or response.is_done():
-                await interaction.followup.send(
-                    "Voting for this matchup is closed.", ephemeral=True
-                )
-            else:
-                await response.send_message("Voting for this matchup is closed.", ephemeral=True)
+            # Send the error before waiting for a possibly throttled board edit.
+            await self._fail(interaction, "Voting for this matchup is closed.")
+            if interaction.message is not None:
+                edit = getattr(interaction, "edit_original_response", None)
+                if edit is not None:
+                    try:
+                        await self.board_updates.queue(
+                            interaction.message.id, edit, terminal=True, view=None
+                        )
+                    except discord.HTTPException:
+                        log.warning("Could not disable closed voting board", exc_info=True)
             return
-        confirmation = (
-            f"🗳️ You voted for **{name}** — you can change your vote until the round ends."
-        )
-        if response is None or response.is_done():
-            await interaction.followup.send(confirmation, ephemeral=True)
-        else:
-            await response.send_message(confirmation, ephemeral=True)
+        # VoteButton deferred a component update: the original response is the
+        # PUBLIC BOARD. Delete only this returned ephemeral follow-up receipt.
+        try:
+            receipt = await interaction.followup.send(
+                f"🗳️ Voted for **{name}**", ephemeral=True, wait=True
+            )
+            await receipt.delete(delay=VOTE_CONFIRMATION_SECONDS)
+        except discord.HTTPException:
+            log.warning(
+                "Could not send/clean up vote receipt for match %s", match_id, exc_info=True
+            )
 
     async def vote_board_content(self, bracket: Bracket, matches: list[Match]) -> str:
-        """Render compact shared-board totals without repeating long item names."""
+        """Rebuild all participation totals from storage, never from message text."""
         if not matches:
             return "No open matchups."
-        first_round = await db.round_matches(self.bot.db, bracket.id, 1)
-        total_rounds = logic.round_count(2 * len(first_round))
-        label = logic.round_label(matches[0].round, total_rounds)
+        label = await self.publisher._round_label(bracket, matches[0].round)
         first_slot, last_slot = matches[0].slot, matches[-1].slot
         span = str(first_slot) if first_slot == last_slot else f"{first_slot}–{last_slot}"
-        lines = [f"**{label} — Matchups {span}**", "Choose a labeled button below:"]
         names = await db.item_names(self.bot.db, bracket.id)
-        for match in matches:
-            votes_a, votes_b = await db.tally(self.bot.db, match.id)
-            a_name = logic.truncate(_esc(names.get(match.item_a)), 60)
-            b_name = logic.truncate(_esc(names.get(match.item_b)), 60)
-            lines.append(
-                f"**Matchup {match.slot}:** **{a_name}** vs **{b_name}** · "
-                f"{vote_count_line(votes_a + votes_b)}"
-            )
-        return "\n".join(lines)
+        totals = {match.id: sum(await db.tally(self.bot.db, match.id)) for match in matches}
+
+        def render_board(limit: int) -> str:
+            lines = [f"**{label} — Matchups {span}**", "Choose a labeled button below:"]
+            for match in matches:
+                a_name = _esc(logic.truncate(names.get(match.item_a, "?"), limit))
+                b_name = _esc(logic.truncate(names.get(match.item_b, "?"), limit))
+                lines.append(
+                    f"**Matchup {match.slot}:** **{a_name}** vs **{b_name}** · "
+                    f"{vote_count_line(totals[match.id])}"
+                )
+            return "\n".join(lines)
+
+        return _fit_board(render_board)
 
     async def render_png(self, bracket_id: int, *, as_finished: bool = False) -> bytes:
         """Render the bracket; as_finished draws the champion cell even though
@@ -485,7 +481,7 @@ class BracketCog(commands.GroupCog, name="bracket"):
 
     @staticmethod
     async def _fail(interaction: discord.Interaction, message: str) -> None:
-        if interaction.response.is_done():
+        if getattr(interaction, "response", None) is None or interaction.response.is_done():
             await interaction.followup.send(message, ephemeral=True)
         else:
             await interaction.response.send_message(message, ephemeral=True)
@@ -1015,9 +1011,11 @@ class BracketCog(commands.GroupCog, name="bracket"):
 
     async def _disable_open_matchups(self, bracket: Bracket) -> None:
         """Best effort: strip vote buttons from still-open matchup messages."""
-        if bracket.context_type == "private":
-            return
         matches = await db.round_matches(self.bot.db, bracket.id, bracket.current_round)
+        if bracket.context_type == "private":
+            for message_id in {m.message_id for m in matches if m.message_id is not None}:
+                await self.board_updates.finish(message_id)
+            return
         try:
             channel = await self.publisher._channel(bracket)
         except ChannelUnavailable:
@@ -1030,7 +1028,12 @@ class BracketCog(commands.GroupCog, name="bracket"):
                 continue
             seen_messages.add(match.message_id)
             try:
-                await channel.get_partial_message(match.message_id).edit(view=None)
+                await self.board_updates.queue(
+                    match.message_id,
+                    channel.get_partial_message(match.message_id).edit,
+                    terminal=True,
+                    view=None,
+                )
             except discord.HTTPException:
                 continue
 
@@ -1070,13 +1073,15 @@ async def help_command(interaction: discord.Interaction) -> None:
             "Run a tournament bracket where the channel votes each matchup.\n\n"
             "**Setup** — `/bracket create`, then `/bracket add` each contender "
             "(`rename`/`remove`/`items` to manage, `editmode`/`editor` to control who edits).\n"
-            "**Rounds** — `/bracket start [round_minutes]` posts each matchup with vote "
-            "buttons. Rounds close on the timer, or the owner runs `/bracket next` "
+            "**Rounds** — `/bracket start [round_minutes]` groups up to 10 matchups per "
+            "voting board. Choose a numbered button; you can change your vote until closure. "
+            "Rounds close on the timer, or the owner runs `/bracket next` "
             "(with a confirmation). Ties are settled by coin flip.\n"
             "**Anytime** — `/bracket show` re-posts the bracket image, "
             "`/bracket transfer` hands the bracket over, `/bracket cancel` ends it.\n\n"
             "Choices and contender tallies are private while a round is open; the total "
-            "number of votes counted is public. Results and the bracket image are public."
+            "number of votes counted is public. Results and the bracket image are public. "
+            f"Private vote receipts disappear after {VOTE_CONFIRMATION_SECONDS} seconds."
             f"{private_note}"
         ),
         color=discord.Color.blurple(),

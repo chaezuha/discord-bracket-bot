@@ -28,7 +28,7 @@ class NullPublisher:
     async def post_matchup(self, bracket, match, a_name, b_name):
         return next(self._ids)
 
-    async def reveal_result(self, bracket, result):
+    async def reveal_board(self, bracket, message_id, results):
         pass
 
     async def post_round_summary(self, bracket, round_no, results):

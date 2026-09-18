@@ -74,7 +74,7 @@ def vote_view(match_id: int, a_name: str, b_name: str) -> discord.ui.View:
 
 
 def vote_board_view(matches: list[Match], names: dict[int, str]) -> discord.ui.View:
-    """Build a compact private-chat board: two matchups per row, ten per message."""
+    """Build a compact voting board: two matchups per row, ten per message."""
     if len(matches) > 10:
         raise ValueError("a vote board can contain at most 10 matchups")
     view = discord.ui.View(timeout=None)

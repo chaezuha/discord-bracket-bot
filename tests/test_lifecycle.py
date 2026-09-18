@@ -42,8 +42,9 @@ class FakePublisher:
         self._record("matchup", match.id)
         return next(self._ids)
 
-    async def reveal_result(self, bracket, result):
-        self._record("reveal", result.match.id)
+    async def reveal_board(self, bracket, message_id, results):
+        for result in results:
+            self._record("reveal", result.match.id)
 
     async def post_round_summary(self, bracket, round_no, results):
         self._record("summary", round_no)

@@ -14,6 +14,7 @@ class FakeMessage:
         self.content = content
         self.kwargs = kwargs
         self.edits = []
+        self.delete = AsyncMock()
 
 
 class FakeResponse:
@@ -271,10 +272,11 @@ async def test_private_shared_board_vote_updates_and_closed_click_disables(conn)
     vote.message = board
     vote.response._done = True  # VoteButton defers before delegating to the cog.
     await cog.handle_vote(vote, matches[0].id, "a")
+    await cog.board_updates._workers[board.id].task
 
     assert "**Matchup 1:**" in board.content and "🗳️ **1 vote counted**" in board.content
     assert "**Matchup 2:**" in board.content and "🗳️ **0 votes counted**" in board.content
-    assert "You voted" in vote.followup.messages[0].content
+    assert "Voted for" in vote.followup.messages[0].content
 
     await lifecycle.close_round(conn, bracket_id, random.Random(0))
     late = FakeInteraction(user_id=21)

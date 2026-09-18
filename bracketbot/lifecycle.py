@@ -65,8 +65,10 @@ class Publisher(Protocol):
     ) -> dict[int, int]:
         """Post votable matchup messages; return match id -> message id."""
 
-    async def reveal_result(self, bracket: Bracket, result: MatchResult) -> None:
-        """Edit a matchup message: disable buttons, show the tally and winner."""
+    async def reveal_board(
+        self, bracket: Bracket, message_id: int, results: list[MatchResult]
+    ) -> None:
+        """Edit a whole board once: disable buttons and reveal every matchup."""
 
     async def post_round_summary(
         self, bracket: Bracket, round_no: int, results: list[MatchResult]
@@ -200,11 +202,21 @@ async def publish_round(
     results = await _load_results(conn, bracket_id, matches)
     is_final = len(matches) == 1
 
+    boards: dict[int, list[MatchResult]] = {}
     for result in results:
-        if not result.match.published:
-            if result.match.message_id is not None:
-                await publisher.reveal_result(bracket, result)
+        if result.match.message_id is not None:
+            boards.setdefault(result.match.message_id, []).append(result)
+        elif not result.match.published:
             await db.mark_published(conn, result.match.id)
+    for message_id, board_results in boards.items():
+        if all(result.match.published for result in board_results):
+            continue
+        # Include already-marked siblings too, for recovery from older versions
+        # or a crash after an edit. The complete board render is idempotent.
+        await publisher.reveal_board(bracket, message_id, board_results)
+        async with db.transaction(conn):
+            for result in board_results:
+                await db.mark_published(conn, result.match.id)
 
     if bracket.last_summary_round < round_no:
         # Posted before the marker is set: a crash in between means a rare
@@ -272,12 +284,16 @@ async def ensure_round_posted(
                 )
         else:
             message_ids = await batch_poster(bracket, batch, names)
-        for match in batch:
-            try:
-                message_id = message_ids[match.id]
-            except KeyError:
-                raise RuntimeError(f"publisher did not return a message id for match {match.id}")
-            await db.set_message_id(conn, match.id, message_id)
+        # A shared board must never be only partially associated after a crash.
+        async with db.transaction(conn):
+            for match in batch:
+                try:
+                    message_id = message_ids[match.id]
+                except KeyError:
+                    raise RuntimeError(
+                        f"publisher did not return a message id for match {match.id}"
+                    )
+                await db.set_message_id(conn, match.id, message_id)
     await db.execute(
         conn,
         "UPDATE brackets SET round_closes_at = ? WHERE id = ? AND round_state = 'open'",
