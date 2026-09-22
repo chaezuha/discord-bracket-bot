@@ -8,6 +8,10 @@ import gc
 import itertools
 import random
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import discord
+import pytest
 
 from bracketbot import cog as cog_module
 from bracketbot import db, lifecycle
@@ -19,14 +23,16 @@ OWNER_ID = 10  # matches the conftest bracket fixture
 class NullPublisher:
     """Publisher that succeeds silently."""
 
+    matchup_batch_size = 1
+
     def __init__(self):
         self._ids = itertools.count(1000)
 
     async def post_round_open(self, bracket, round_no, closes_at):
         pass
 
-    async def post_matchup(self, bracket, match, a_name, b_name):
-        return next(self._ids)
+    async def post_matchups(self, bracket, matches, names):
+        return {match.id: next(self._ids) for match in matches}
 
     async def reveal_board(self, bracket, message_id, results):
         pass
@@ -313,3 +319,143 @@ async def test_champion_image_includes_champion_cell(conn, bracket_id):
     normal = Image.open(io.BytesIO(await cog.render_png(bracket_id)))
     finished = Image.open(io.BytesIO(await cog.render_png(bracket_id, as_finished=True)))
     assert finished.width > normal.width  # extra column = the champion cell
+
+
+# --- replying before slow work -------------------------------------------------
+
+
+async def test_next_while_closing_replies_before_ticking(conn, bracket_id):
+    for name in ("A", "B", "C", "D"):
+        await db.add_item(conn, bracket_id, name)
+    cog = make_cog(conn)
+    await start(cog, FakeInteraction())
+    assert await lifecycle.close_round(conn, bracket_id, random.Random(0))
+
+    interaction = FakeInteraction()
+    replied_before_publish = []
+
+    class RecordingPublisher(NullPublisher):
+        async def post_round_summary(self, bracket, round_no, results):
+            replied_before_publish.append(interaction.response.is_done())
+
+    cog.publisher = RecordingPublisher()
+    await BracketCog.next_round.callback(cog, interaction)
+
+    assert replied_before_publish == [True]
+    assert any("already being closed" in m for m in interaction.all_messages())
+
+
+async def test_transfer_acknowledges_while_bracket_lock_is_held(conn, bracket_id):
+    cog = make_cog(conn)
+    interaction = FakeInteraction()
+    target = SimpleNamespace(id=20, mention="<@20>")
+
+    lock = cog._lock(bracket_id)
+    async with lock:  # e.g. a tick publishing a whole round
+        task = asyncio.create_task(BracketCog.transfer.callback(cog, interaction, target))
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert interaction.response.is_done()
+        assert not task.done()
+    await task
+
+    assert (await db.get_bracket(conn, bracket_id)).owner_id == 20
+    announcement = interaction.followup.messages[-1]
+    assert "now belongs to" in announcement[0]
+    assert announcement[1]["ephemeral"] is False
+
+
+# --- scheduler -----------------------------------------------------------------
+
+
+async def _due_bracket(conn, cog, channel_id):
+    bracket_id = await db.create_bracket(
+        conn,
+        guild_id=1,
+        channel_id=channel_id,
+        owner_id=OWNER_ID,
+        name=f"Bracket {channel_id}",
+        edit_mode="open",
+        seeding="order",
+        created_at=0,
+    )
+    for name in ("A", "B", "C", "D"):
+        await db.add_item(conn, bracket_id, name)
+    await lifecycle.start_bracket(conn, bracket_id, random.Random(0))
+    await db.set_round_seconds(conn, bracket_id, 60)
+    assert await cog._tick(bracket_id)  # posts round 1 and arms the timer
+    await db.execute(conn, "UPDATE brackets SET round_closes_at = 1 WHERE id = ?", (bracket_id,))
+    return bracket_id
+
+
+async def test_scheduler_does_not_wait_on_a_stuck_bracket(conn):
+    cog = make_cog(conn)
+    stuck = await _due_bracket(conn, cog, 700)
+    healthy = await _due_bracket(conn, cog, 701)
+
+    lock = cog._lock(stuck)
+    async with lock:
+        await asyncio.wait_for(cog.scheduler(), 1)  # returns without waiting on ticks
+        await asyncio.wait_for(cog._tick_tasks[healthy], 1)
+        assert (await db.get_bracket(conn, healthy)).current_round == 2
+        assert (await db.get_bracket(conn, stuck)).current_round == 1
+        stuck_task = cog._tick_tasks[stuck]
+        await cog.scheduler()  # a second pass must not stack another tick
+        assert cog._tick_tasks[stuck] is stuck_task
+    await asyncio.wait_for(stuck_task, 1)
+    assert (await db.get_bracket(conn, stuck)).current_round == 2
+    assert not cog._tick_tasks
+
+
+# --- channel errors --------------------------------------------------------------
+
+
+def _forbidden(code):
+    response = SimpleNamespace(status=403, reason="Forbidden")
+    return discord.Forbidden(response, {"code": code, "message": "no"})
+
+
+@pytest.mark.parametrize(("code", "status"), [(50013, "running"), (50001, "cancelled")])
+async def test_only_lost_channel_access_cancels(conn, bracket_id, code, status):
+    class Channel:
+        async def send(self, **kwargs):
+            raise _forbidden(code)
+
+    cog = BracketCog(SimpleNamespace(db=conn, get_channel=lambda _: Channel()))
+    cog.render_png = AsyncMock(return_value=b"png")
+    for name in ("A", "B"):
+        await db.add_item(conn, bracket_id, name)
+    await lifecycle.start_bracket(conn, bracket_id, random.Random(0))
+
+    posted = await cog._tick(bracket_id)
+
+    assert (await db.get_bracket(conn, bracket_id)).status == status
+    assert posted is (status == "cancelled")  # a cancel is a completed tick
+
+
+# --- render cache ----------------------------------------------------------------
+
+
+async def test_render_cache_hit_skips_vote_queries(conn, bracket_id, monkeypatch):
+    import bracketbot.render as render_module
+
+    monkeypatch.setattr(render_module, "render_bracket", lambda *a, **k: b"png")
+    calls = []
+    real_tallies = db.tallies
+
+    async def counting_tallies(*args):
+        calls.append(args)
+        return await real_tallies(*args)
+
+    monkeypatch.setattr(db, "tallies", counting_tallies)
+    cog = make_cog(conn)
+    for name in ("A", "B", "C", "D"):
+        await db.add_item(conn, bracket_id, name)
+    await lifecycle.start_bracket(conn, bracket_id, random.Random(0))
+    assert await lifecycle.close_round(conn, bracket_id, random.Random(0))
+    calls.clear()
+
+    await cog.render_png(bracket_id)
+    assert len(calls) == 1
+    await cog.render_png(bracket_id)
+    assert len(calls) == 1  # served from cache without touching votes

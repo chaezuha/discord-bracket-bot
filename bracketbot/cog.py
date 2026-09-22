@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import functools
 import io
 import logging
 import random
@@ -39,6 +40,11 @@ BOARD_MATCHES = 10
 VOTE_CONFIRMATION_SECONDS = 8
 PRIVATE_FOLLOWUP_LIMIT = 5
 
+# Discord error codes meaning the channel itself is gone for the bot (Unknown
+# Channel, Missing Access). Anything else, e.g. 50013 Missing Permissions after
+# a mod edits overrides, is recoverable and must not cancel the bracket.
+_CHANNEL_GONE_CODES = frozenset({10003, 50001})
+
 BAD_NAME_MESSAGE = (
     f"That name is empty, longer than {logic.MAX_NAME_LENGTH} characters, "
     "or contains unsupported characters."
@@ -56,6 +62,12 @@ def _fit_board(render_content: Callable[[int], str]) -> str:
         if len(content) <= MESSAGE_CONTENT_LIMIT:
             return content
     raise ValueError("Board cannot fit within Discord's message limit")
+
+
+def _round_label(names: dict[int, str], round_no: int) -> str:
+    """Round name from the item count (items are locked once a bracket runs)."""
+    total = logic.round_count(logic.bracket_size(len(names)))
+    return logic.round_label(round_no, total)
 
 
 def _context_type(interaction: discord.Interaction) -> str:
@@ -79,8 +91,10 @@ class DiscordPublisher:
     """lifecycle.Publisher backed by a real Discord channel.
 
     Per-message failures (deleted message, missing permission on one edit) are
-    logged and swallowed; only an unusable channel raises ChannelUnavailable,
-    which makes the lifecycle auto-cancel the bracket.
+    logged and swallowed; only a channel that is gone for the bot raises
+    ChannelUnavailable, which makes the lifecycle auto-cancel the bracket.
+    Missing send permissions propagate as Forbidden so the tick fails and the
+    scheduler retries once they are restored.
     """
 
     matchup_batch_size = BOARD_MATCHES
@@ -93,25 +107,29 @@ class DiscordPublisher:
         if channel is None:
             try:
                 channel = await self.cog.bot.fetch_channel(bracket.channel_id)
-            except (discord.NotFound, discord.Forbidden) as exc:
+            except discord.NotFound as exc:
                 raise ChannelUnavailable(str(exc)) from exc
+            except discord.Forbidden as exc:
+                if exc.code in _CHANNEL_GONE_CODES:
+                    raise ChannelUnavailable(str(exc)) from exc
+                raise
         return channel
 
     async def _send(self, bracket: Bracket, **kwargs) -> discord.Message:
         channel = await self._channel(bracket)
         try:
             return await channel.send(**kwargs)
-        except discord.Forbidden as exc:
-            raise ChannelUnavailable(str(exc)) from exc
+        except (discord.Forbidden, discord.NotFound) as exc:
+            if exc.code in _CHANNEL_GONE_CODES:
+                raise ChannelUnavailable(str(exc)) from exc
+            raise
 
     async def _image(self, bracket: Bracket, *, as_finished: bool = False) -> discord.File:
         data = await self.cog.render_png(bracket.id, as_finished=as_finished)
         return discord.File(io.BytesIO(data), filename=f"bracket-{bracket.id}.png")
 
     async def _round_label(self, bracket: Bracket, round_no: int) -> str:
-        first_round = await db.round_matches(self.cog.bot.db, bracket.id, 1)
-        total = logic.round_count(2 * len(first_round))
-        return logic.round_label(round_no, total)
+        return _round_label(await db.item_names(self.cog.bot.db, bracket.id), round_no)
 
     def _result_line(self, result: MatchResult) -> str:
         m = result.match
@@ -148,7 +166,7 @@ class DiscordPublisher:
             board = matches[offset : offset + BOARD_MATCHES]
             message = await self._send(
                 bracket,
-                content=await self.cog.vote_board_content(bracket, board),
+                content=await self.cog.vote_board_content(bracket, board, names),
                 view=vote_board_view(board, names),
             )
             message_ids.update((match.id, message.id) for match in board)
@@ -277,6 +295,9 @@ class BracketCog(commands.GroupCog, name="bracket"):
         # LRU of rendered PNGs, bounded so a long-running bot doesn't keep an
         # image for every bracket it ever drew (incl. finished ones re-shown).
         self._render_cache: OrderedDict[int, tuple[tuple, bytes]] = OrderedDict()
+        # One in-flight scheduler tick per bracket, so a slow or rate-limited
+        # bracket delays only itself.
+        self._tick_tasks: dict[int, asyncio.Task] = {}
 
     def _lock(self, bracket_id: int) -> asyncio.Lock:
         """Per-bracket lifecycle lock. Callers must keep the returned lock in
@@ -293,6 +314,11 @@ class BracketCog(commands.GroupCog, name="bracket"):
 
     async def cog_unload(self) -> None:
         self.scheduler.cancel()
+        tick_tasks = list(self._tick_tasks.values())
+        for task in tick_tasks:
+            task.cancel()
+        await asyncio.gather(*tick_tasks, return_exceptions=True)
+        self._tick_tasks.clear()
         await self.board_updates.close()
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -315,14 +341,27 @@ class BracketCog(commands.GroupCog, name="bracket"):
     @tasks.loop(seconds=SCHEDULER_INTERVAL_SECONDS)
     async def scheduler(self) -> None:
         """Closes due rounds and resumes any half-published state; the first
-        pass after startup doubles as crash recovery."""
+        pass after startup doubles as crash recovery.
+
+        Each bracket ticks in its own task and the pass returns without waiting,
+        so one bracket stuck on Discord rate limits can't hold every other
+        bracket past its deadline."""
         try:
             brackets = await db.list_schedulable_brackets(self.bot.db)
         except Exception:
             log.exception("Scheduler could not list brackets")
             return
         for bracket in brackets:
-            await self._tick(bracket.id)
+            running = self._tick_tasks.get(bracket.id)
+            if running is not None and not running.done():
+                continue
+            task = asyncio.create_task(self._tick(bracket.id))
+            self._tick_tasks[bracket.id] = task
+            task.add_done_callback(functools.partial(self._forget_tick, bracket.id))
+
+    def _forget_tick(self, bracket_id: int, task: asyncio.Task) -> None:
+        if self._tick_tasks.get(bracket_id) is task:
+            del self._tick_tasks[bracket_id]
 
     @scheduler.before_loop
     async def _wait_ready(self) -> None:
@@ -341,6 +380,14 @@ class BracketCog(commands.GroupCog, name="bracket"):
                     now=int(time.time()),
                     rng=_rng,
                 )
+            except discord.Forbidden as exc:
+                # Recoverable permission gap; one line per retry, no traceback.
+                log.warning(
+                    "Bracket %s: missing permissions in its channel (%s); retrying",
+                    bracket_id,
+                    exc,
+                )
+                return False
             except Exception:
                 log.exception("Tick failed for bracket %s (will retry)", bracket_id)
                 return False
@@ -367,11 +414,13 @@ class BracketCog(commands.GroupCog, name="bracket"):
                 name = _esc(names.get(item_id))
                 message = interaction.message
                 if message is not None:
-                    board = await db.matches_for_message(self.bot.db, message.id)
-                    content = await self.vote_board_content(bracket, board)
                     edit = getattr(interaction, "edit_original_response", None) or message.edit
+                    # Board text is built when the throttled edit goes out, so
+                    # a burst of clicks costs one rebuild per edit, not per vote.
                     self.board_updates.queue(
-                        message.id, edit, content=content, view=vote_board_view(board, names)
+                        message.id,
+                        edit,
+                        build=functools.partial(self._board_kwargs, bracket, message.id),
                     )
 
         if not accepted:
@@ -399,15 +448,28 @@ class BracketCog(commands.GroupCog, name="bracket"):
                 "Could not send/clean up vote receipt for match %s", match_id, exc_info=True
             )
 
-    async def vote_board_content(self, bracket: Bracket, matches: list[Match]) -> str:
+    async def _board_kwargs(self, bracket: Bracket, message_id: int) -> dict:
+        """Fresh content + buttons for a voting board message."""
+        board = await db.matches_for_message(self.bot.db, message_id)
+        names = await db.item_names(self.bot.db, bracket.id)
+        return {
+            "content": await self.vote_board_content(bracket, board, names),
+            "view": vote_board_view(board, names),
+        }
+
+    async def vote_board_content(
+        self, bracket: Bracket, matches: list[Match], names: dict[int, str] | None = None
+    ) -> str:
         """Rebuild all participation totals from storage, never from message text."""
         if not matches:
             return "No open matchups."
-        label = await self.publisher._round_label(bracket, matches[0].round)
+        if names is None:
+            names = await db.item_names(self.bot.db, bracket.id)
+        label = _round_label(names, matches[0].round)
         first_slot, last_slot = matches[0].slot, matches[-1].slot
         span = str(first_slot) if first_slot == last_slot else f"{first_slot}–{last_slot}"
-        names = await db.item_names(self.bot.db, bracket.id)
-        totals = {match.id: sum(await db.tally(self.bot.db, match.id)) for match in matches}
+        counts = await db.tallies(self.bot.db, [match.id for match in matches])
+        totals = {match_id: sum(votes) for match_id, votes in counts.items()}
 
         def render_board(limit: int) -> str:
             lines = [f"**{label} — Matchups {span}**", "Choose a labeled button below:"]
@@ -429,13 +491,9 @@ class BracketCog(commands.GroupCog, name="bracket"):
         bracket = await db.get_bracket(conn, bracket_id)
         if as_finished:
             bracket = dataclasses.replace(bracket, status=FINISHED)
-        items = await db.item_names(conn, bracket_id)
         matches = await db.list_matches(conn, bracket_id)
-        votes = {
-            m.id: await db.tally(conn, m.id)
-            for m in matches
-            if m.winner is not None and m.decided_by in ("votes", "coinflip")
-        }
+        # Names are locked once running and decided tallies never change, so
+        # the key covers everything drawn; check it before loading the rest.
         key = (
             bracket.status,
             bracket.current_round,
@@ -446,6 +504,15 @@ class BracketCog(commands.GroupCog, name="bracket"):
         if cached and cached[0] == key:
             self._render_cache.move_to_end(bracket_id)
             return cached[1]
+        items = await db.item_names(conn, bracket_id)
+        votes = await db.tallies(
+            conn,
+            [
+                m.id
+                for m in matches
+                if m.winner is not None and m.decided_by in ("votes", "coinflip")
+            ],
+        )
         async with self._render_sem:
             data = await asyncio.to_thread(render.render_bracket, bracket, items, matches, votes)
         self._render_cache[bracket_id] = (key, data)
@@ -545,7 +612,7 @@ class BracketCog(commands.GroupCog, name="bracket"):
         needle = current.casefold()
         items = await db.list_items(self.bot.db, bracket.id)
         return [
-            app_commands.Choice(name=item.name, value=str(item.id))
+            app_commands.Choice(name=item.name, value=f"{db.ITEM_REF_PREFIX}{item.id}")
             for item in items
             if needle in item.name.casefold()
         ][:25]
@@ -711,12 +778,15 @@ class BracketCog(commands.GroupCog, name="bracket"):
         if bracket is None:
             await self._fail(interaction, "No active bracket in this channel.")
             return
+        # The lock can be held by a tick publishing a whole round; acknowledge
+        # before waiting so the interaction can't time out.
+        await interaction.response.defer(ephemeral=True)
         lock = self._lock(bracket.id)
         async with lock:
             if await self._recheck_manager(interaction, bracket.id) is None:
                 return
             await db.set_edit_mode(self.bot.db, bracket.id, mode)
-        await interaction.response.send_message(f"Edit mode is now **{mode}**.", ephemeral=True)
+        await interaction.followup.send(f"Edit mode is now **{mode}**.", ephemeral=True)
 
     @editor.command(name="add", description="Allow a user to edit the bracket when restricted")
     async def editor_add(self, interaction: discord.Interaction, user: discord.User) -> None:
@@ -724,14 +794,15 @@ class BracketCog(commands.GroupCog, name="bracket"):
         if bracket is None:
             await self._fail(interaction, "No active bracket in this channel.")
             return
+        # The lock can be held by a tick publishing a whole round; acknowledge
+        # before waiting so the interaction can't time out.
+        await interaction.response.defer(ephemeral=True)
         lock = self._lock(bracket.id)
         async with lock:
             if await self._recheck_manager(interaction, bracket.id) is None:
                 return
             await db.add_editor(self.bot.db, bracket.id, user.id)
-        await interaction.response.send_message(
-            f"{user.mention} can now edit items.", ephemeral=True
-        )
+        await interaction.followup.send(f"{user.mention} can now edit items.", ephemeral=True)
 
     @editor.command(name="remove", description="Take a user's edit access away")
     async def editor_remove(self, interaction: discord.Interaction, user: discord.User) -> None:
@@ -739,12 +810,15 @@ class BracketCog(commands.GroupCog, name="bracket"):
         if bracket is None:
             await self._fail(interaction, "No active bracket in this channel.")
             return
+        # The lock can be held by a tick publishing a whole round; acknowledge
+        # before waiting so the interaction can't time out.
+        await interaction.response.defer(ephemeral=True)
         lock = self._lock(bracket.id)
         async with lock:
             if await self._recheck_manager(interaction, bracket.id) is None:
                 return
             removed = await db.remove_editor(self.bot.db, bracket.id, user.id)
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"{user.mention} {'no longer has' if removed else 'did not have'} edit access.",
             ephemeral=True,
         )
@@ -755,13 +829,20 @@ class BracketCog(commands.GroupCog, name="bracket"):
         if bracket is None:
             await self._fail(interaction, "No active bracket in this channel.")
             return
+        # The lock can be held by a tick publishing a whole round; acknowledge
+        # before waiting so the interaction can't time out.
+        await interaction.response.defer(ephemeral=True)
         lock = self._lock(bracket.id)
         async with lock:
             if await self._recheck_manager(interaction, bracket.id) is None:
                 return
             await db.set_owner(self.bot.db, bracket.id, user.id)
-        await interaction.response.send_message(
+        # The first follow-up fills the ephemeral deferred reply; the second
+        # is the public announcement.
+        await interaction.followup.send("Done.", ephemeral=True)
+        await interaction.followup.send(
             f"**{_esc(bracket.name)}** now belongs to {user.mention}.",
+            ephemeral=False,
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
@@ -850,8 +931,10 @@ class BracketCog(commands.GroupCog, name="bracket"):
                 )
             return
         if bracket.round_state != "open":
-            await self._tick(bracket.id)  # nudge a stuck publish along
+            # Reply first: the tick may publish a whole round, far past
+            # Discord's 3-second acknowledgement window.
             await self._fail(interaction, "That round is already being closed.")
+            await self._tick(bracket.id)  # nudge a stuck publish along
             return
         deadline = (
             f"It would otherwise close <t:{bracket.round_closes_at}:R>."
@@ -859,6 +942,7 @@ class BracketCog(commands.GroupCog, name="bracket"):
             else "It has no timer."
         )
         view = ConfirmView()
+        view.origin = interaction
         await interaction.response.send_message(
             f"Round {bracket.current_round} is still open. {deadline}\n"
             "Close it now and count the votes?",
@@ -975,6 +1059,7 @@ class BracketCog(commands.GroupCog, name="bracket"):
             await self._fail(interaction, "Only the bracket owner or a moderator can do that.")
             return
         view = ConfirmView()
+        view.origin = interaction
         await interaction.response.send_message(
             f"Cancel **{_esc(bracket.name)}**? This can't be undone.", view=view, ephemeral=True
         )

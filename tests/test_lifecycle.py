@@ -19,6 +19,8 @@ class Boom(RuntimeError):
 
 
 class FakePublisher:
+    matchup_batch_size = 1  # one match per "message", for per-match crash points
+
     def __init__(self):
         self.events: list[tuple] = []
         self.crash_on: dict[str, int] = {}  # kind -> 1-based call number to die on
@@ -38,9 +40,12 @@ class FakePublisher:
     async def post_round_open(self, bracket, round_no, closes_at):
         self._record("round_open", round_no, closes_at)
 
-    async def post_matchup(self, bracket, match, a_name, b_name):
-        self._record("matchup", match.id)
-        return next(self._ids)
+    async def post_matchups(self, bracket, matches, names):
+        message_ids = {}
+        for match in matches:
+            self._record("matchup", match.id)
+            message_ids[match.id] = next(self._ids)
+        return message_ids
 
     async def reveal_board(self, bracket, message_id, results):
         for result in results:

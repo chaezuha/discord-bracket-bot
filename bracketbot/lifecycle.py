@@ -148,10 +148,10 @@ async def close_round(
 
         bracket = await db.get_bracket(conn, bracket_id)
         matches = await db.round_matches(conn, bracket_id, bracket.current_round)
+        counts = await db.tallies(conn, [m.id for m in matches if m.winner is None])
         for match in matches:
             if match.winner is None:
-                votes_a, votes_b = await db.tally(conn, match.id)
-                winner, decided_by = logic.decide(votes_a, votes_b, rng)
+                winner, decided_by = logic.decide(*counts[match.id], rng)
                 await db.execute(
                     conn,
                     "UPDATE matches SET winner = ?, decided_by = ? WHERE id = ?",
@@ -176,9 +176,10 @@ async def _load_results(
     conn: aiosqlite.Connection, bracket_id: int, matches: list[Match]
 ) -> list[MatchResult]:
     names = await db.item_names(conn, bracket_id)
+    counts = await db.tallies(conn, [match.id for match in matches])
     results = []
     for match in matches:
-        votes_a, votes_b = await db.tally(conn, match.id)
+        votes_a, votes_b = counts[match.id]
         results.append(
             MatchResult(
                 match=match,
@@ -267,23 +268,10 @@ async def ensure_round_posted(
         # after this line can duplicate the header on restart — harmless.
         await publisher.post_round_open(bracket, bracket.current_round, closes_at)
     names = await db.item_names(conn, bracket_id)
-    batch_size = max(1, getattr(publisher, "matchup_batch_size", 1))
-    batch_poster = getattr(publisher, "post_matchups", None)
+    batch_size = max(1, publisher.matchup_batch_size)
     for offset in range(0, len(missing), batch_size):
         batch = missing[offset : offset + batch_size]
-        if batch_poster is None:
-            # Compatibility for third-party/test publishers that implement the
-            # original one-match-at-a-time protocol.
-            message_ids = {}
-            for match in batch:
-                message_ids[match.id] = await publisher.post_matchup(
-                    bracket,
-                    match,
-                    names.get(match.item_a, "?"),
-                    names.get(match.item_b, "?"),
-                )
-        else:
-            message_ids = await batch_poster(bracket, batch, names)
+        message_ids = await publisher.post_matchups(bracket, batch, names)
         # A shared board must never be only partially associated after a crash.
         async with db.transaction(conn):
             for match in batch:

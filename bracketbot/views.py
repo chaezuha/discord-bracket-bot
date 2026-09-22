@@ -16,15 +16,6 @@ def vote_count_line(count: int) -> str:
     return f"{VOTE_COUNT_PREFIX}**{count} {noun} counted**"
 
 
-def with_vote_count(content: str | None, count: int) -> str:
-    """Add or replace the public participation total on a matchup message."""
-    lines = [
-        line for line in (content or "").splitlines() if not line.startswith(VOTE_COUNT_PREFIX)
-    ]
-    lines.append(vote_count_line(count))
-    return "\n".join(lines)
-
-
 class VoteButton(
     discord.ui.DynamicItem[discord.ui.Button],
     template=r"vote:(?P<match_id>[0-9]+):(?P<choice>[ab])",
@@ -66,13 +57,6 @@ class VoteButton(
         await cog.handle_vote(interaction, self.match_id, self.choice)
 
 
-def vote_view(match_id: int, a_name: str, b_name: str) -> discord.ui.View:
-    view = discord.ui.View(timeout=None)
-    view.add_item(VoteButton(match_id, "a", label=a_name))
-    view.add_item(VoteButton(match_id, "b", label=b_name))
-    return view
-
-
 def vote_board_view(matches: list[Match], names: dict[int, str]) -> discord.ui.View:
     """Build a compact voting board: two matchups per row, ten per message."""
     if len(matches) > 10:
@@ -100,19 +84,38 @@ def vote_board_view(matches: list[Match], names: dict[int, str]) -> discord.ui.V
     return view
 
 
+CONFIRM_TIMEOUT_MESSAGE = "Timed out. Nothing changed; run the command again."
+
+
 class ConfirmView(discord.ui.View):
-    """Ephemeral yes/no double-check; read .value after wait()."""
+    """Ephemeral yes/no double-check; read .value after wait().
+
+    Set .origin to the interaction that sent the dialog so a timeout can
+    disable the buttons instead of leaving them clickable but dead."""
 
     def __init__(self) -> None:
         super().__init__(timeout=60)
         self.value: bool | None = None
         self.interaction: discord.Interaction | None = None
+        self.origin: discord.Interaction | None = None
+
+    def _disable(self) -> None:
+        for child in self.children:
+            child.disabled = True
+
+    async def on_timeout(self) -> None:
+        self._disable()
+        if self.origin is None:
+            return
+        try:
+            await self.origin.edit_original_response(content=CONFIRM_TIMEOUT_MESSAGE, view=self)
+        except discord.HTTPException:
+            pass
 
     async def _finish(self, interaction: discord.Interaction, value: bool) -> None:
         self.value = value
         self.interaction = interaction
-        for child in self.children:
-            child.disabled = True
+        self._disable()
         await interaction.response.edit_message(view=self)
         self.stop()
 

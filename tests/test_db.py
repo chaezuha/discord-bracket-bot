@@ -80,9 +80,19 @@ async def test_match_slot_unique(conn, bracket_id):
 
 async def test_find_item(conn, bracket_id):
     item_id = await db.add_item(conn, bracket_id, "Pizza Party")
-    assert (await db.find_item(conn, bracket_id, str(item_id))).id == item_id
+    assert (await db.find_item(conn, bracket_id, f"id:{item_id}")).id == item_id
     assert (await db.find_item(conn, bracket_id, "pizza party")).id == item_id
     assert await db.find_item(conn, bracket_id, "nope") is None
+    # A bare number is a name, never an id
+    assert await db.find_item(conn, bracket_id, str(item_id)) is None
+
+
+async def test_find_item_numeric_name_never_hits_another_items_id(conn, bracket_id):
+    first = await db.add_item(conn, bracket_id, "Pizza")
+    numeric = await db.add_item(conn, bracket_id, str(first))
+    assert numeric != first
+    assert (await db.find_item(conn, bracket_id, str(first))).id == numeric
+    assert (await db.find_item(conn, bracket_id, f"id:{first}")).id == first
 
 
 async def test_shuffle_positions_keeps_unique(conn, bracket_id):
@@ -112,6 +122,38 @@ async def test_cast_vote_upsert_and_tally(conn, bracket_id):
     assert await db.cast_vote(conn, match_id, 2, "a", now=0)
     assert await db.cast_vote(conn, match_id, 1, "b", now=0)  # change of heart, one vote
     assert await db.tally(conn, match_id) == (1, 1)
+
+
+async def test_tallies_batches_and_fills_zeros(conn, bracket_id):
+    voted = await _running_match(conn, bracket_id)
+    cur = await conn.execute(
+        "INSERT INTO matches (bracket_id, round, slot) VALUES (?, 1, 2)", (bracket_id,)
+    )
+    unvoted = cur.lastrowid
+    for user_id, choice in ((1, "a"), (2, "b"), (3, "b")):
+        assert await db.cast_vote(conn, voted, user_id, choice, now=0)
+    assert await db.tallies(conn, [voted, unvoted]) == {voted: (1, 2), unvoted: (0, 0)}
+    assert await db.tallies(conn, []) == {}
+
+
+async def test_failed_migration_leaves_schema_and_version_untouched(tmp_path, monkeypatch):
+    path = str(tmp_path / "broken.db")
+    await (await db.connect(path)).close()
+    # A migration that changes the schema, then fails partway through.
+    monkeypatch.setattr(
+        db,
+        "MIGRATIONS",
+        [*db.MIGRATIONS, "ALTER TABLE brackets ADD COLUMN extra INTEGER; SELECT * FROM nope;"],
+    )
+    with pytest.raises(Exception, match="nope"):
+        await db.connect(path)
+
+    check = await aiosqlite.connect(path)
+    async with check.execute("PRAGMA user_version") as cur:
+        assert (await cur.fetchone())[0] == len(db.MIGRATIONS) - 1
+    async with check.execute("PRAGMA table_info(brackets)") as cur:
+        assert "extra" not in {row[1] for row in await cur.fetchall()}
+    await check.close()
 
 
 async def test_cast_vote_rejected_after_deadline(conn, bracket_id):

@@ -24,10 +24,12 @@ async def _rendered(conn, bracket_id, n, finish=False):
 
 
 class _NullPublisher:
+    matchup_batch_size = 1
+
     async def post_round_open(self, *a): ...
 
-    async def post_matchup(self, *a):
-        return 1
+    async def post_matchups(self, bracket, matches, names):
+        return {match.id: 1 for match in matches}
 
     async def reveal_board(self, *a): ...
 

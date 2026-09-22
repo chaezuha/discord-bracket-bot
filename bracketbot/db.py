@@ -106,8 +106,17 @@ async def connect(path: str) -> aiosqlite.Connection:
     async with conn.execute("PRAGMA user_version") as cur:
         version = (await cur.fetchone())[0]
     for number, script in enumerate(MIGRATIONS[version:], start=version + 1):
-        await conn.executescript(script)
-        await conn.execute(f"PRAGMA user_version = {number}")
+        # Schema change and version bump commit together: a crash between them
+        # would otherwise re-run a non-idempotent migration on the next start.
+        try:
+            await conn.executescript(
+                f"BEGIN IMMEDIATE;\n{script}\nPRAGMA user_version = {number};\nCOMMIT;"
+            )
+        except BaseException:
+            if conn.in_transaction:
+                await conn.execute("ROLLBACK")
+            await conn.close()
+            raise
     # Serializes all statements against explicit transactions: aiosqlite runs
     # everything on one shared connection, so a statement issued between another
     # task's BEGIN and COMMIT would join (and roll back with) that transaction.
@@ -351,20 +360,28 @@ async def item_names(conn: aiosqlite.Connection, bracket_id: int) -> dict[int, s
     return {item.id: item.name for item in await list_items(conn, bracket_id)}
 
 
+ITEM_REF_PREFIX = "id:"
+
+
 async def find_item(conn: aiosqlite.Connection, bracket_id: int, ref: str) -> Item | None:
-    """Resolve an autocomplete value: item id as digits, else case-insensitive name."""
-    if ref.isdigit():
-        row = await fetchone(
-            conn, "SELECT * FROM items WHERE bracket_id = ? AND id = ?", (bracket_id, int(ref))
-        )
-        if row:
-            return _item(row)
+    """Resolve a typed name (case-insensitive) or an autocomplete value
+    ("id:<item id>"). Names win, so an item literally named like another
+    item's id can never resolve to the wrong one."""
     row = await fetchone(
         conn,
         "SELECT * FROM items WHERE bracket_id = ? AND name = ? COLLATE NOCASE",
         (bracket_id, ref.strip()),
     )
-    return _item(row) if row else None
+    if row:
+        return _item(row)
+    item_id = ref.removeprefix(ITEM_REF_PREFIX)
+    if ref.startswith(ITEM_REF_PREFIX) and item_id.isdigit():
+        row = await fetchone(
+            conn, "SELECT * FROM items WHERE bracket_id = ? AND id = ?", (bracket_id, int(item_id))
+        )
+        if row:
+            return _item(row)
+    return None
 
 
 async def shuffle_positions(
@@ -461,3 +478,23 @@ async def tally(conn: aiosqlite.Connection, match_id: int) -> tuple[int, int]:
     )
     counts = {r["choice"]: r["n"] for r in rows}
     return counts.get("a", 0), counts.get("b", 0)
+
+
+async def tallies(
+    conn: aiosqlite.Connection, match_ids: Iterable[int]
+) -> dict[int, tuple[int, int]]:
+    """(votes_a, votes_b) for many matches in one query; (0, 0) when unvoted."""
+    ids = list(match_ids)
+    counts = {match_id: [0, 0] for match_id in ids}
+    if not ids:
+        return {}
+    placeholders = ", ".join("?" * len(ids))
+    rows = await fetchall(
+        conn,
+        f"SELECT match_id, choice, COUNT(*) AS n FROM votes WHERE match_id IN ({placeholders})"
+        " GROUP BY match_id, choice",
+        ids,
+    )
+    for row in rows:
+        counts[row["match_id"]][0 if row["choice"] == "a" else 1] = row["n"]
+    return {match_id: (a, b) for match_id, (a, b) in counts.items()}

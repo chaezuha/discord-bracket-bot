@@ -2,7 +2,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from bracketbot.views import VoteButton, vote_count_line, with_vote_count
+from bracketbot.views import (
+    CONFIRM_TIMEOUT_MESSAGE,
+    ConfirmView,
+    VoteButton,
+    vote_count_line,
+)
 
 
 @pytest.mark.parametrize(
@@ -17,11 +22,26 @@ def test_vote_count_line_pluralizes(count, expected):
     assert vote_count_line(count) == expected
 
 
-def test_with_vote_count_adds_and_replaces_total():
-    matchup = "**Final — Matchup 1**\n**Pizza**  vs  **Tacos**"
-    with_zero = with_vote_count(matchup, 0)
-    assert with_zero == f"{matchup}\n🗳️ **0 votes counted**"
-    assert with_vote_count(with_zero, 3) == f"{matchup}\n🗳️ **3 votes counted**"
+async def test_confirm_view_timeout_disables_buttons_and_explains():
+    edits = []
+
+    class Origin:
+        async def edit_original_response(self, **kwargs):
+            edits.append(kwargs)
+
+    view = ConfirmView()
+    view.origin = Origin()
+    await view.on_timeout()
+
+    assert all(child.disabled for child in view.children)
+    assert edits == [{"content": CONFIRM_TIMEOUT_MESSAGE, "view": view}]
+    assert view.value is None
+
+
+async def test_confirm_view_timeout_without_origin_only_disables():
+    view = ConfirmView()
+    await view.on_timeout()
+    assert all(child.disabled for child in view.children)
 
 
 async def test_vote_button_defers_privately_and_delegates():
