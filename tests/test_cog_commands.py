@@ -353,9 +353,14 @@ async def test_transfer_acknowledges_while_bracket_lock_is_held(conn, bracket_id
     lock = cog._lock(bracket_id)
     async with lock:  # e.g. a tick publishing a whole round
         task = asyncio.create_task(BracketCog.transfer.callback(cog, interaction, target))
-        for _ in range(10):
-            await asyncio.sleep(0)
-        assert interaction.response.is_done()
+
+        # The pre-lock DB lookup runs on aiosqlite's worker thread, so a fixed
+        # number of event-loop yields isn't enough; poll until the defer lands.
+        async def acknowledged():
+            while not interaction.response.is_done():
+                await asyncio.sleep(0.001)
+
+        await asyncio.wait_for(acknowledged(), 1)
         assert not task.done()
     await task
 
