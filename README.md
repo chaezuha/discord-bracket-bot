@@ -2,231 +2,243 @@
 
 [![CI](https://github.com/chaezuha/discord-bracket-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/chaezuha/discord-bracket-bot/actions/workflows/ci.yml)
 
-A self-hostable Discord bot for tournament-style voting brackets. Someone
-creates a bracket ("Best movie snack"), the channel fills it with contenders,
-and then everyone votes each matchup round by round — complete with a
-rendered bracket image — until a champion is crowned.
+A self-hostable Discord bot for tournament-style voting brackets, built on
+discord.py and SQLite. Someone creates a bracket ("Best movie snack"), the
+channel fills it with contenders, and then everyone votes on each matchup,
+round by round, until a champion is crowned.
+
+<!-- Screenshot suggestion: a rendered bracket image next to a voting board. -->
 
 ## Features
 
-- `/bracket create` starts a bracket in the channel; anyone can add items, or
-  restrict editing to the owner plus chosen editors (`/bracket editmode`,
-  `/bracket editor`) — switchable at any time
-- Rounds run on a timer (`/bracket start round_minutes`), by manual advance
-  (`/bracket next`, with an are-you-sure confirmation), or both
-- Compact voting boards group up to 10 matchups per message in every context.
-  Choose a numbered button; you can change your vote until the round closes.
-  Private vote receipts ("only visible to you") disappear after 8 seconds.
-  Public participation totals refresh at most once per second per board while
-  each contender's tally stays hidden until the reveal to avoid bandwagoning
-- A 16-entry bracket opens with two public messages (image plus voting board);
-  a 64-entry bracket opens with five (image plus four boards). Server and bot-DM
-  boards show all their results in place when closed; friend/group DMs keep
-  separate result summaries
-- The bracket is rendered as an image: a proper tournament tree with vote
-  counts and highlighted winners at every level, updated as rounds finish
-- Proper seeding with byes when the item count isn't a power of two
-  (byes never face each other), optional shuffle at start
-- Ties — including 0-0 — are settled by a fair coin flip and announced as such
-- Round results and the champion announcement are public; setup and edit
-  commands respond privately to avoid channel spam
-- Everything is persisted in SQLite: running brackets, votes, and timers all
-  survive bot restarts, and vote buttons keep working afterwards
-- Bracket owners can hand over control (`/bracket transfer`); moderators
-  (Manage Channels/Administrator) can always step in on any bracket
-- Slash commands, no privileged intents required
-- Works in servers, DMs with the bot, friend DMs, and group DMs. Friend/group
-  DM brackets advance manually with `/bracket next`; server and bot-DM
-  brackets can also use timers
+- **Build brackets together:** Anyone in the channel can add contenders, or you can restrict editing to the owner and chosen editors. You can switch modes at any time.
+- **Flexible rounds:** Rounds close on a timer, when the owner advances them manually, or both.
+- **Compact voting boards:** Each message holds up to 10 matchups with numbered buttons. You can change your vote until the round closes, and your vote receipt is private.
+- **No bandwagoning:** Everyone sees how many people have voted, but each contender's tally stays hidden until the round's results are revealed.
+- **Bracket image:** A rendered tournament tree with vote counts and highlighted winners at every level, updated after each round.
+- **Fair seeding and ties:** Brackets of any size get byes where needed (byes never face each other), with optional shuffling at start. Ties, including 0-0, are settled by an announced coin flip.
+- **Survives restarts:** Running brackets, votes, and timers are saved in SQLite, and vote buttons keep working after the bot restarts.
+- **Works anywhere:** Servers, threads, DMs with the bot, friend DMs, and group DMs. Slash commands only, no privileged intents.
 
-## Commands
+## Quick start
 
-| Command                          | What it does                                                                                       |
-| -------------------------------- | -------------------------------------------------------------------------------------------------- |
-| `/bracket create <name> [edit_mode] [seeding]` | Create a bracket in this channel or conversation (one active bracket per channel).   |
-| `/bracket add <item>`            | Add a contender (before the bracket starts).                                                       |
-| `/bracket rename <item> <new_name>` | Rename a contender (autocompletes).                                                             |
-| `/bracket remove <item>`         | Remove a contender (autocompletes).                                                                |
-| `/bracket items`                 | Privately list the current contenders.                                                             |
-| `/bracket editmode <open\|restricted>` | Toggle whether anyone or only owner+editors may edit items.                                  |
-| `/bracket editor add/remove <user>` | Grant or revoke edit access for the restricted mode.                                            |
-| `/bracket start [round_minutes]` | Lock the items and start round 1. With `round_minutes`, rounds close automatically; without, only `/bracket next` advances. |
-| `/bracket next`                  | Close the current round now (asks for confirmation if it's still open).                            |
-| `/bracket show`                  | Re-post the bracket image (30s cooldown per channel).                                              |
-| `/bracket transfer <user>`       | Hand bracket ownership to someone else.                                                            |
-| `/bracket cancel`                | Cancel the bracket (asks for confirmation).                                                        |
-| `/help`                          | How it all works.                                                                                  |
+You need [Docker](https://docs.docker.com/get-docker/) with Compose and a Discord account.
 
-Everyone who can see a matchup can vote. Users with the app installed can use
-`/bracket show`, `/bracket items`, and `/help`; item editing follows the
-bracket's edit mode. Round control
-(`start`/`next`/`cancel`/`transfer`/`editmode`/`editor`) is for the bracket
-owner — and for moderators with **Manage Channels** or **Administrator**, so
-a bracket can't lock up a channel if its owner disappears. To limit who can
-run `/bracket create`, use Discord's built-in per-command permissions
+1. **Create the Discord application.**
+   1. In the [Discord Developer Portal](https://discord.com/developers/applications), create a **New Application**.
+   2. Under **Bot**, click **Reset Token** and copy the token. No privileged intents are needed.
+   3. Under **Installation**, enable both **Guild Install** and **User Install**, and select **Discord Provided Link**. Set these defaults, then save:
+      - **User Install:** `applications.commands`
+      - **Guild Install:** `applications.commands` and `bot`, with View Channels, Send Messages, Send Messages in Threads, Embed Links, and Attach Files
+   4. Open the install link from that page. Choose **Add to server** for server use, and **Add to my apps** for DMs and group DMs (see [Where it works](#where-it-works)).
+2. **Start the bot.**
+
+   ```sh
+   git clone https://github.com/chaezuha/discord-bracket-bot.git   # get compose.yaml and .env.example
+   cd discord-bracket-bot                                           # enter the project folder
+   cp .env.example .env                                             # create your config, then paste your token after DISCORD_TOKEN=
+   docker compose up -d                                             # pull the prebuilt image and start in the background
+   docker compose logs -f                                           # watch the logs (Ctrl+C to stop watching)
+   ```
+
+That's it. In any channel the bot can see, run `/bracket create Best movie snack`
+and add a few items with `/bracket add`.
+
+> [!TIP]
+> **Commands don't show up?** New slash commands can take up to an hour to
+> appear in Discord. For instant commands while testing, set `DEV_GUILD_ID` to
+> your server's ID in `.env` and run `docker compose up -d` again.
+
+The prebuilt image supports amd64 and arm64, so a Raspberry Pi works too. The
+clone is only a convenient way to get [`compose.yaml`](compose.yaml) and
+[`.env.example`](.env.example). You can put those two files in any folder
+instead and run the same commands there.
+
+## Usage
+
+### Commands
+
+| Command | What it does |
+| --- | --- |
+| `/bracket create <name> [edit_mode] [seeding]` | Create a bracket in this channel or conversation (one active bracket per channel). `edit_mode` is `open` (default) or `restricted`. `seeding` is `order` (default) or `shuffle`. |
+| `/bracket add <item>` | Add a contender (before the bracket starts). |
+| `/bracket rename <item> <new_name>` | Rename a contender (autocompletes). |
+| `/bracket remove <item>` | Remove a contender (autocompletes). |
+| `/bracket items` | Privately list the current contenders. |
+| `/bracket editmode <open\|restricted>` | Choose whether anyone, or only the owner and editors, may edit items. |
+| `/bracket editor add <user>` / `/bracket editor remove <user>` | Grant or revoke edit access for restricted mode. |
+| `/bracket start [round_minutes]` | Lock the items and start round 1. With `round_minutes` (1 to 10080), rounds close automatically. Without it, only `/bracket next` advances. |
+| `/bracket next` | Close the current round now (asks for confirmation if it's still open). |
+| `/bracket show` | Re-post the bracket image (30 second cooldown per channel). |
+| `/bracket transfer <user>` | Hand bracket ownership to someone else. |
+| `/bracket cancel` | Cancel the bracket (asks for confirmation). |
+| `/help` | How it all works. |
+
+Round results and the champion announcement are public. Setup and edit
+commands reply privately so the channel doesn't fill with noise.
+
+### What you see while voting
+
+- Each round posts a voting board with up to 10 matchups per message. A
+  16-entry bracket opens with two messages (image plus one board). A 64-entry
+  bracket opens with five (image plus four boards).
+- Pick a numbered button to vote. Your private receipt ("only visible to you")
+  disappears after 8 seconds.
+- Vote totals on each board refresh at most once per second.
+- When a round closes, server and bot-DM boards show their results in place.
+  Friend and group DMs get separate result summaries.
+
+### Permissions
+
+Everyone who can see a matchup can vote. Item editing follows the bracket's
+edit mode. Anyone with the app installed can use `/bracket show`,
+`/bracket items`, and `/help`.
+
+The exceptions are round control commands (`start`, `next`, `cancel`,
+`transfer`, `editmode`, and `editor`). Only the bracket owner can use them,
+plus server moderators with **Manage Channels** or **Administrator**, so a
+bracket can't lock up a channel if its owner disappears.
+
+To limit who can run `/bracket create`, use Discord's per-command permissions
 (**Server Settings → Integrations → the bot**).
 
-In DMs and group DMs there are no server moderators, so only the bracket owner
-has owner-level control. An open bracket can still be edited by anyone in the
-conversation who installs the app, and explicitly selected editors can edit a
-restricted bracket.
+### Where it works
 
-## Setup
+| Place | Install needed | Notes |
+| --- | --- | --- |
+| Servers and threads | **Add to server** | Timers and manual rounds. Threads need the Send Messages in Threads permission. |
+| DMs with the bot | **Add to my apps** | Timers and manual rounds. |
+| Friend DMs and group DMs | **Add to my apps** | Manual rounds only (`/bracket next`). There are no moderators, so only the owner has round control. Anyone in the conversation with the app installed can edit an open bracket. |
 
-### 1. Create the Discord application
+If you use your user-installed commands in a server that hasn't added the bot,
+the bot tells you the server needs to install it first.
 
-1. Go to the [Discord Developer Portal](https://discord.com/developers/applications) and create a **New Application**.
-2. Under **Bot**, click **Reset Token** and copy the token (you'll need it for `.env`). No privileged intents are needed.
-3. Open **Installation** and enable both **Guild Install** and **User Install**
-   under Installation Contexts.
-4. Select **Discord Provided Link**. Configure the defaults as follows, then
-   save the application:
-   - **User Install:** `applications.commands`
-   - **Guild Install:** `applications.commands` and `bot`, with View Channels,
-     Send Messages, Send Messages in Threads, Embed Links, and Attach Files
-5. Copy the install link from that page. Choose **Add to server** for normal
-   server use, and choose **Add to my apps** to make the commands available in
-   DMs and group DMs. Install both ways if you want both surfaces.
+The bracket image supports Latin, Cyrillic, and Greek text. Emoji and CJK
+characters in item names show as boxes in the image, but display normally in
+messages.
 
-User installation is required for friend/group-DM commands. A server install
-is still required in servers so the bot can post timed rounds and apply the
-normal moderator permission rules.
+## Configuration
 
-### 2. Run with Docker Compose (recommended)
+Set these in `.env` (see [`.env.example`](.env.example)).
 
-Clone the repo, paste your bot token into `.env`, and start it:
+| Variable | Required | What it does |
+| --- | --- | --- |
+| `DISCORD_TOKEN` | yes | Bot token from the Developer Portal. |
+| `DEV_GUILD_ID` | no | Server ID that gets an instant copy of the slash commands while testing. Global commands still sync as usual. Default: unset. |
+| `MAX_ITEMS` | no | Maximum items per bracket, from 2 to 64. Default: `32`. |
+| `DB_PATH` | no | SQLite database location. Default: `./data/brackets.db` (the compose file mounts a volume there). |
+| `LOG_DIR` | no | Directory for rotating log files. If it isn't writable, the bot logs to the console only. Default: `./logs`. |
 
-```sh
-git clone https://github.com/chaezuha/discord-bracket-bot.git
-cd discord-bracket-bot
-cp .env.example .env          # then edit .env and paste your bot token
-docker compose up -d          # pulls the prebuilt GHCR image (no local build)
-docker compose logs -f        # follow logs
-```
+> [!WARNING]
+> Keep `.env` private. Anyone with `DISCORD_TOKEN` can control your bot. If it
+> leaks, click **Reset Token** in the Developer Portal and update `.env`.
+>
+> Run only **one** bot process against a database. SQLite is single-writer and
+> the bot assumes it is the only process.
 
-Nothing is built locally — the compose file pulls the prebuilt multi-arch
-image (amd64 and arm64, so a Raspberry Pi works too). Technically the only
-files you need are [`compose.yaml`](compose.yaml) and a `.env` (see
-[`.env.example`](.env.example)); the clone is just a convenient way to get
-them. If you'd rather skip it, put those two files in any folder and run the
-same `docker compose` commands there — the result is identical.
+## Other ways to run
 
-The compose file sets `restart: unless-stopped`, so the bot comes back on its
-own after crashes and reboots. Bracket state lives in the `botdata` volume;
-running brackets, votes, and round timers all pick up where they left off
-after a restart. Run **one** bot container against that volume — SQLite is
-single-writer and the bot assumes it's the only process.
+### Plain Docker
 
-To update, run `up` again (the compose file pulls the latest image on every
-start):
-
-```sh
-docker compose up -d
-```
-
-#### Logs
-
-Besides `docker compose logs`, the bot writes rotating log files (about
-10 MB of recent history, including whatever led up to a crash) to a
-`botlogs` volume:
-
-```sh
-docker compose exec bot tail -F logs/bot.log
-```
-
-Use `tail -F` (capital F) so following continues across log rotation. The
-same directory holds `faulthandler.log`, a normally-empty file that only
-receives a traceback if the process dies hard. If you'd rather have the
-files directly on the host, replace the `botlogs` volume with a
-`./logs:/app/logs` bind mount — but create `./logs` yourself with
-permissions the container's `bot` user can write to, or the bot falls back
-to console-only logging (the same goes for `botdata`/`./data`).
-
-The compose file also runs the container with a read-only filesystem, no
-capabilities, and memory/PID limits.
-
-### Alternative: plain Docker
-
-Same image, without Compose (again with your token in `.env`; the `-v` flag
-keeps bracket state across restarts):
+Use the same prebuilt image without Compose. Put your token in `.env` first.
+The `-v` flag keeps bracket state across restarts.
 
 ```sh
 docker run --env-file .env -v bracketdata:/app/data ghcr.io/chaezuha/discord-bracket-bot:latest
 ```
 
-Or build it yourself from a clone:
+### Build the image yourself
+
+From a clone of the repo:
 
 ```sh
-docker build -t discord-bracket-bot .
-docker run --env-file .env -v bracketdata:/app/data discord-bracket-bot
+docker build -t discord-bracket-bot .                                  # build the image locally
+docker run --env-file .env -v bracketdata:/app/data discord-bracket-bot  # run it with persistent data
 ```
 
-### Alternative: run directly with Python
+### Run directly with Python
 
-You'll need Python 3.10+ and, for nicer bracket images, the DejaVu fonts
-(`sudo apt install fonts-dejavu-core` on Debian/Ubuntu; macOS's built-in
-Arial is picked up automatically). Then:
+You need Python 3.10 or newer. For nicer bracket images, install the DejaVu
+fonts (`sudo apt install fonts-dejavu-core` on Debian/Ubuntu). On macOS, the
+built-in Arial is used automatically.
 
 ```sh
-git clone <this repo>
-cd discord-bracket-bot
-python3 -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-cp .env.example .env        # then edit .env and paste your bot token
-python bot.py
+git clone https://github.com/chaezuha/discord-bracket-bot.git   # get the code
+cd discord-bracket-bot                                           # enter the project folder
+python3 -m venv .venv                                            # create a virtual environment
+source .venv/bin/activate                                        # activate it (Windows: .venv\Scripts\activate)
+pip install -r requirements.txt                                  # install dependencies
+cp .env.example .env                                             # create your config, then paste your token
+python bot.py                                                    # start the bot
 ```
 
-### Slash-command sync
+## Running it long-term
 
-Global commands sync automatically on startup, including when `DEV_GUILD_ID`
-is set (DM commands are always global). A global sync can take up to an hour to
-show up in Discord; `DEV_GUILD_ID` also creates an instant server-local copy
-while testing.
+These steps assume the [Quick start](#quick-start) Docker Compose setup.
 
-## Configuration (`.env`)
+### Updating
 
-| Variable        | Required | Description                                                                    |
-| --------------- | -------- | ------------------------------------------------------------------------------ |
-| `DISCORD_TOKEN` | yes      | Bot token from the Developer Portal.                                           |
-| `DEV_GUILD_ID`  | no       | Server ID for instant slash-command sync during development.                   |
-| `MAX_ITEMS`     | no       | Maximum items per bracket, 2–64 (default `32`).                                |
-| `DB_PATH`       | no       | SQLite database location (default `./data/brackets.db`; the compose file mounts a volume there). |
-| `LOG_DIR`       | no       | Directory for rotating log files (default `./logs`). Falls back to console-only logging if unwritable. |
+The compose file pulls the latest image every time it starts, so updating is:
+
+```sh
+docker compose up -d
+```
+
+### Restarts
+
+The compose file sets `restart: unless-stopped`, so the bot comes back on its
+own after crashes and reboots. Running brackets, votes, and round timers pick
+up where they left off. If the bot was down past a round's deadline, that
+round closes on startup and the next one gets its full duration.
+
+### Logs
+
+Follow the console output with `docker compose logs -f`. The bot also writes
+rotating log files (about 12 MB of recent history, including whatever led up
+to a crash) to the `botlogs` volume:
+
+```sh
+docker compose exec bot tail -F logs/bot.log
+```
+
+Use `tail -F` (capital F) so following continues across log rotation. The same
+directory holds `faulthandler.log`, which stays empty unless the process dies
+hard.
+
+To keep the files on the host instead, replace the `botlogs` volume in
+`compose.yaml` with a `./logs:/app/logs` bind mount. Create `./logs` yourself
+with permissions the container's `bot` user can write to, or the bot falls back
+to console-only logging. The same applies if you swap `botdata` for `./data`.
+
+### Backups
+
+All bracket state lives in the `botdata` volume. Stop the bot first so the
+database is idle, then copy it out:
+
+```sh
+docker compose stop                                                  # stop the bot so the database isn't being written
+docker cp "$(docker compose ps -aq bot)":/app/data ./bracket-backup  # copy the data folder to ./bracket-backup
+docker compose start                                                 # start the bot again
+```
+
+### Security hardening
+
+The compose file already runs the container with a read-only filesystem, all
+capabilities dropped, `no-new-privileges`, and memory and PID limits. The bot
+runs as a non-root `bot` user. Only the data volume, the log volume, and `/tmp`
+are writable. See the [Configuration warning](#configuration) for keeping your
+token safe.
 
 ## Development
 
 ```sh
-pip install -r requirements-dev.txt
-pytest            # logic, db-constraint, lifecycle/crash-recovery, render tests
-ruff check .      # lint
-ruff format .     # format
+pip install -r requirements-dev.txt   # install test and lint tools
+pytest                                # run the test suite
+ruff check .                          # lint
+ruff format .                         # format
 ```
 
-CI runs lint, the test suite on Python 3.10/3.12/3.14, a dependency audit
-(`pip-audit`), and a Docker build + container smoke test on every push and
-PR. Pushes to `main` and `v*` tags publish a multi-arch image to GHCR only
-after all of those pass — the amd64 image that was smoke-tested is what gets
-pushed.
-
-## Notes
-
-- Commands work in servers, threads, DMs with the bot, friend DMs, and group
-  DMs. Threads require Send Messages in Threads. Friend/group DMs are powered
-  by the user-installed app and must use manual `/bracket next` rounds because
-  Discord interaction tokens expire before a long-running timer can publish.
-- If a user-installed command appears in a server where the bot itself is not
-  installed, it explains that the server must install the bot instead of
-  starting a bracket that cannot publish later.
-- Round closing is atomic and idempotent: winners, coin flips, and the next
-  round's pairings are persisted before anything is posted, so a crash or
-  restart mid-round never rerolls a result or advances a bracket twice. If
-  the bot was down past a round's deadline, the round closes on startup and
-  the next one gets its full configured duration.
-- If the bracket's channel is deleted (or the bot loses access to it), the
-  bracket is cancelled automatically instead of wedging the scheduler.
-- The bracket image uses DejaVu/Arial, which covers Latin, Cyrillic, and
-  Greek; emoji or CJK in item names show as boxes in the image (they render
-  fine in the messages themselves).
-- Coin flips use OS entropy (`random.SystemRandom`), and the result is
-  persisted before it's announced — retries can't change an outcome.
+CI runs on every push and pull request: lint and format checks, tests on
+Python 3.10, 3.12, and 3.14, a dependency audit (`pip-audit`), and a Docker
+build with a container smoke test. Pushes to `main` and `v*` tags publish a
+multi-arch image to GHCR only after all of those pass.
